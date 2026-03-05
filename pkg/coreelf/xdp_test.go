@@ -127,7 +127,7 @@ func generateIPv4TCPOutput(t *testing.T) []byte {
 
 	tcph.SetNetworkLayerForChecksum(iph)
 	err := gopacket.SerializeLayers(buf, opts,
-		&layers.Ethernet{DstMAC: []byte{0x00, 0x60, 0xb9, 0xe6, 0x20, 0xfb}, SrcMAC: []byte{0xbe, 0xfd, 0x30, 0xae, 0x56, 0xb9}, EthernetType: layers.EthernetTypeIPv6},
+		&layers.Ethernet{DstMAC: testDstMAC[:], SrcMAC: testExternalMAC[:], EthernetType: layers.EthernetTypeIPv6},
 		ip6h, eiph,
 		&layers.Ethernet{DstMAC: []byte{0x00, 0x00, 0x5e, 0x00, 0x11, 0x01}, SrcMAC: []byte{0x00, 0x00, 0x5e, 0x00, 0x11, 0x02}, EthernetType: layers.EthernetTypeIPv4},
 		iph,
@@ -169,6 +169,34 @@ func ebpfTestRun(input []byte, prog *ebpf.Program, xdpctx XdpMd) (uint32, []byte
 	return ret, opts.DataOut, nil
 }
 
+var (
+	testExternalMAC = [6]byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01}
+	testDstMAC      = [6]byte{0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02}
+)
+
+func setupTestTunnelConfig(t *testing.T, m *ebpf.Map) {
+	t.Helper()
+	cfg := coreelf.TunnelConfig{
+		InternalIfindex: 3, ExternalIfindex: 2, TunnelIfindex: 4,
+		TunnelMAC:   testExternalMAC,
+		InternalMAC: testExternalMAC,
+		ExternalMAC: testExternalMAC,
+		DstMAC:      testDstMAC,
+	}
+	copy(cfg.SrcAddr[:], net.ParseIP("fe80::1").To16())
+	copy(cfg.DstAddr[:], net.ParseIP("fe80::2").To16())
+	if err := coreelf.PopulateTunnelConfig(m, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setupTestDevmap(t *testing.T, m *ebpf.Map) {
+	t.Helper()
+	if err := coreelf.PopulateRedirectDevmap(m, 2, 3); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestXDPProg(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Fatal(err)
@@ -184,6 +212,9 @@ func TestXDPProg(t *testing.T) {
 	}
 	defer objs.Close()
 
+	setupTestTunnelConfig(t, objs.TunnelConfigMap)
+	setupTestDevmap(t, objs.RedirectDevmap)
+
 	input := generateIPv4TCPInput(t)
 	xdpmd := XdpMd{
 		Data:           0,
@@ -196,12 +227,10 @@ func TestXDPProg(t *testing.T) {
 		t.Error(err)
 	}
 
-	// retern code should be XDP_REDIRECT
 	if ret != 4 {
-		t.Errorf("got %d want %d", ret, 4)
+		t.Errorf("got %d, want XDP_REDIRECT(4)", ret)
 	}
 
-	// check output
 	want := generateIPv4TCPOutput(t)
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Logf("input: %x", input)

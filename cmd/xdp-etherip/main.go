@@ -1,87 +1,281 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/pkg/errors"
-	"github.com/urfave/cli"
+	"github.com/cilium/ebpf"
+	"github.com/urfave/cli/v3"
+	"github.com/vishvananda/netlink"
 	"github.com/x86taka/xdp-etherip/pkg/coreelf"
 	"github.com/x86taka/xdp-etherip/pkg/version"
 	"github.com/x86taka/xdp-etherip/pkg/xdptool"
 )
 
 func main() {
-	app := newApp(version.Version)
-	if err := app.Run(os.Args); err != nil {
+	cmd := newApp(version.Version)
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
 		log.Fatalf("%+v", err)
 	}
 }
 
-func newApp(version string) *cli.App {
-	app := cli.NewApp()
-	app.Name = "goxdp_tmp"
-	app.Version = version
-
-	app.Usage = "A template for writing XDP programs in Go"
-
-	app.EnableBashCompletion = true
-	app.Flags = []cli.Flag{
-		cli.StringSliceFlag{
-			Name:  "device",
-			Value: &cli.StringSlice{"eth1"},
-			Usage: "Adding a device to attach",
+func newApp(version string) *cli.Command {
+	return &cli.Command{
+		Name:                  "xdp-etherip",
+		Version:               version,
+		Usage:                 "XDP-based EtherIP tunnel (RFC 3378)",
+		EnableShellCompletion: true,
+		Flags: []cli.Flag{
+			&cli.StringFlag{
+				Name:     "external",
+				Usage:    "Tunnel-facing interface name",
+				Required: true,
+			},
+			&cli.StringFlag{
+				Name:     "tunnel",
+				Usage:    "Tunnel interface name (veth pair auto-created)",
+				Required: true,
+			},
+			&cli.StringFlag{
+				Name:     "src-ip6",
+				Usage:    "Local tunnel endpoint IPv6 address",
+				Required: true,
+			},
+			&cli.StringFlag{
+				Name:     "dst-ip6",
+				Usage:    "Remote tunnel endpoint IPv6 address",
+				Required: true,
+			},
 		},
+		Action: run,
 	}
-	app.Action = run
-	return app
 }
 
-func disposeDevice(devices []string) error {
-	for _, dev := range devices {
-		err := xdptool.Detach(dev)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		log.Println("detach device: ", dev)
+func resolveIfindex(device string) (uint32, error) {
+	link, err := netlink.LinkByName(device)
+	if err != nil {
+		return 0, fmt.Errorf("resolve ifindex for %s: %w", device, err)
 	}
+	return uint32(link.Attrs().Index), nil
+}
+
+func parseIPv6ToBytes(addr string) ([16]byte, error) {
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return [16]byte{}, fmt.Errorf("invalid IPv6 address: %s", addr)
+	}
+	ip = ip.To16()
+	if ip == nil {
+		return [16]byte{}, fmt.Errorf("not an IPv6 address: %s", addr)
+	}
+	var result [16]byte
+	copy(result[:], ip)
+	return result, nil
+}
+
+func getInterfaceMAC(name string) ([6]byte, error) {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return [6]byte{}, fmt.Errorf("get link %s: %w", name, err)
+	}
+	hwAddr := link.Attrs().HardwareAddr
+	if len(hwAddr) < 6 {
+		return [6]byte{}, fmt.Errorf("no MAC address on %s", name)
+	}
+	var mac [6]byte
+	copy(mac[:], hwAddr)
+	return mac, nil
+}
+
+func resolveNextHop(dstIP net.IP) (net.IP, error) {
+	routes, err := netlink.RouteGet(dstIP)
+	if err != nil {
+		return nil, fmt.Errorf("route lookup %s: %w", dstIP, err)
+	}
+	if len(routes) == 0 {
+		return nil, fmt.Errorf("no route to %s", dstIP)
+	}
+	if routes[0].Gw != nil {
+		return routes[0].Gw, nil
+	}
+	return dstIP, nil
+}
+
+func resolveNeighborMAC(ifindex int, ip net.IP) ([6]byte, error) {
+	neighs, err := netlink.NeighList(ifindex, netlink.FAMILY_V6)
+	if err != nil {
+		return [6]byte{}, fmt.Errorf("list neighbors: %w", err)
+	}
+	for _, n := range neighs {
+		if n.IP.Equal(ip) && len(n.HardwareAddr) >= 6 {
+			var mac [6]byte
+			copy(mac[:], n.HardwareAddr)
+			return mac, nil
+		}
+	}
+	return [6]byte{}, fmt.Errorf("no neighbor entry for %s", ip)
+}
+
+func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string) (coreelf.TunnelConfig, error) {
+	externalDev := cmd.String("external")
+	externalIdx, err := resolveIfindex(externalDev)
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	internalIdx, err := resolveIfindex(xdpEnd)
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	tunnelIdx, err := resolveIfindex(tunnelName)
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	srcAddr, err := parseIPv6ToBytes(cmd.String("src-ip6"))
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	dstAddr, err := parseIPv6ToBytes(cmd.String("dst-ip6"))
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	tunnelMAC, err := getInterfaceMAC(tunnelName)
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	xdpEndMAC, err := getInterfaceMAC(xdpEnd)
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	externalMAC, err := getInterfaceMAC(externalDev)
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	dstIP := net.ParseIP(cmd.String("dst-ip6"))
+	nextHop, err := resolveNextHop(dstIP)
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	dstMAC, err := resolveNeighborMAC(int(externalIdx), nextHop)
+	if err != nil {
+		return coreelf.TunnelConfig{}, err
+	}
+	return coreelf.TunnelConfig{
+		SrcAddr:         srcAddr,
+		DstAddr:         dstAddr,
+		InternalIfindex: internalIdx,
+		ExternalIfindex: externalIdx,
+		TunnelIfindex:   tunnelIdx,
+		TunnelMAC:       tunnelMAC,
+		InternalMAC:     xdpEndMAC,
+		ExternalMAC:     externalMAC,
+		DstMAC:          dstMAC,
+	}, nil
+}
+
+func attachInternalGeneric(prog *ebpf.Program, dev string) error {
+	if err := xdptool.AttachGeneric(prog, dev); err != nil {
+		return fmt.Errorf("attach %s: %w", dev, err)
+	}
+	log.Printf("attached device: %s (generic/SKB)", dev)
 	return nil
 }
 
-func run(ctx *cli.Context) error {
-	devices := ctx.StringSlice("device")
-	log.Println(devices)
-	// get ebpf binary
-	obj, err := coreelf.ReadCollection()
+func dumpDebugCounters(debugMap *ebpf.Map) {
+	counters, err := coreelf.ReadDebugCounters(debugMap)
 	if err != nil {
-		return errors.WithStack(err)
+		log.Printf("read debug counters: %v", err)
+		return
 	}
-
-	//attach xdp
-	for _, dev := range devices {
-		err = xdptool.Attach(obj.XdpProg, dev)
-		if err != nil {
-			return errors.WithStack(err)
+	log.Println("--- debug counters ---")
+	for i, name := range coreelf.DebugCounterNames {
+		if counters[i] > 0 {
+			log.Printf("  %s: %d", name, counters[i])
 		}
-		log.Println("attached device: ", dev)
 	}
+	log.Println("--- end counters ---")
+}
 
+func waitForSignal(devices []string, tunnelName string, debugMap *ebpf.Map) error {
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-
 	log.Println("XDP program successfully loaded and attached.")
 	log.Println("Press CTRL+C to stop.")
-	for {
-		select {
-		case <-signalChan:
-			err := disposeDevice(devices)
-			if err != nil {
-				return errors.WithStack(err)
-			}
-			return nil
-		}
-	}
+	<-signalChan
+	dumpDebugCounters(debugMap)
+	return cleanup(devices, tunnelName)
+}
 
+func cleanup(devices []string, tunnelName string) error {
+	for _, dev := range devices {
+		if err := xdptool.Detach(dev); err != nil {
+			log.Printf("detach %s: %v", dev, err)
+		}
+		log.Println("detach device:", dev)
+	}
+	if err := xdptool.DeleteVethPair(tunnelName); err != nil {
+		return fmt.Errorf("delete veth pair: %w", err)
+	}
+	log.Println("deleted veth pair:", tunnelName)
+	return nil
+}
+
+func loadAndAttach(externalDev string, cfg *coreelf.TunnelConfig, xdpEnd string) ([]string, *ebpf.Map, error) {
+	obj, err := coreelf.ReadCollection()
+	if err != nil {
+		return nil, nil, fmt.Errorf("load ebpf: %w", err)
+	}
+	if err := attachInternalGeneric(obj.XdpProg, externalDev); err != nil {
+		return nil, nil, err
+	}
+	if err := attachInternalGeneric(obj.XdpProg, xdpEnd); err != nil {
+		return nil, nil, err
+	}
+	devices := []string{externalDev, xdpEnd}
+	if err := coreelf.PopulateTunnelConfig(obj.TunnelConfigMap, *cfg); err != nil {
+		return nil, nil, fmt.Errorf("populate tunnel config: %w", err)
+	}
+	if err := coreelf.PopulateRedirectDevmap(obj.RedirectDevmap, cfg.ExternalIfindex, cfg.InternalIfindex); err != nil {
+		return nil, nil, fmt.Errorf("populate redirect devmap: %w", err)
+	}
+	return devices, obj.DebugCounters, nil
+}
+
+func setupTunnel(cmd *cli.Command) (string, string, error) {
+	tunnelName := cmd.String("tunnel")
+	tunnelMTU, err := xdptool.TunnelMTU(cmd.String("external"))
+	if err != nil {
+		return "", "", fmt.Errorf("compute tunnel mtu: %w", err)
+	}
+	xdpEnd, err := xdptool.CreateVethPair(tunnelName, tunnelMTU)
+	if err != nil {
+		return "", "", fmt.Errorf("create veth pair: %w", err)
+	}
+	log.Printf("created veth pair: %s <-> %s (mtu %d)", tunnelName, xdpEnd, tunnelMTU)
+	return tunnelName, xdpEnd, nil
+}
+
+func run(ctx context.Context, cmd *cli.Command) error {
+	tunnelName, xdpEnd, err := setupTunnel(cmd)
+	if err != nil {
+		return err
+	}
+	time.Sleep(500 * time.Millisecond)
+	cfg, err := buildTunnelConfig(cmd, tunnelName, xdpEnd)
+	if err != nil {
+		return err
+	}
+	devices, debugMap, err := loadAndAttach(cmd.String("external"), &cfg, xdpEnd)
+	if err != nil {
+		return err
+	}
+	log.Printf("tunnel config: tunnel_mac=%x internal_mac=%x external_mac=%x dst_mac=%x",
+		cfg.TunnelMAC, cfg.InternalMAC, cfg.ExternalMAC, cfg.DstMAC)
+	log.Printf("tunnel interface %s is ready", tunnelName)
+	return waitForSignal(devices, tunnelName, debugMap)
 }

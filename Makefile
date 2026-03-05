@@ -20,9 +20,17 @@ run:
 gen:
 	go generate pkg/coreelf/elf.go
 
+.PHONY: container-build
+container-build:
+	podman build --platform linux/arm64 -f Containerfile -t $(NAME)-openwrt .
+	mkdir -p bin
+	podman create --name $(NAME)-extract $(NAME)-openwrt
+	podman cp $(NAME)-extract:/$(NAME) bin/$(NAME)-openwrt-aarch64
+	podman rm $(NAME)-extract
+
 .PHONY: clean
 clean:
-	rm -rf ./bin/$(NAME)
+	rm -rf ./bin
 
 .PHONY: test
 test:

@@ -1,6 +1,5 @@
 #include "xdp_prog.h"
 
-#include <arpa/inet.h>
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
 #include <linux/if_vlan.h>
@@ -11,18 +10,44 @@
 #include "bpf_endian.h"
 #include "bpf_helpers.h"
 
-static __always_inline void update_checksum(uint16_t *csum, uint16_t old_val,
-                                            uint16_t new_val) {
-  uint32_t new_csum_value;
-  uint32_t new_csum_comp;
-  uint32_t undo;
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct tunnel_config);
+} tunnel_config_map SEC(".maps");
 
-  undo = ~((uint32_t)*csum) + ~((uint32_t)old_val);
-  new_csum_value = undo + (undo < ~((uint32_t)old_val)) + (uint32_t)new_val;
-  new_csum_comp = new_csum_value + (new_csum_value < ((uint32_t)new_val));
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, DBG_MAX);
+  __type(key, __u32);
+  __type(value, __u64);
+} debug_counters SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_DEVMAP);
+  __uint(max_entries, 2);
+  __type(key, __u32);
+  __type(value, __u32);
+} redirect_devmap SEC(".maps");
+
+static __always_inline void dbg_inc(__u32 idx) {
+  __u64 *val = bpf_map_lookup_elem(&debug_counters, &idx);
+  if (val) __sync_fetch_and_add(val, 1);
+}
+
+static __always_inline void update_checksum(__u16 *csum, __u16 old_val,
+                                            __u16 new_val) {
+  __u32 new_csum_value;
+  __u32 new_csum_comp;
+  __u32 undo;
+
+  undo = ~((__u32)*csum) + ~((__u32)old_val);
+  new_csum_value = undo + (undo < ~((__u32)old_val)) + (__u32)new_val;
+  new_csum_comp = new_csum_value + (new_csum_value < ((__u32)new_val));
   new_csum_comp = (new_csum_comp & 0xFFFF) + (new_csum_comp >> 16);
   new_csum_comp = (new_csum_comp & 0xFFFF) + (new_csum_comp >> 16);
-  *csum = (uint16_t)~new_csum_comp;
+  *csum = (__u16)~new_csum_comp;
 }
 
 static __always_inline int update_tcp_mss(void *data, void *data_end,
@@ -44,17 +69,17 @@ static __always_inline int update_tcp_mss(void *data, void *data_end,
   // if MSS
   if (old_tcp_options->kind == 2 && old_tcp_options->len == 4) {
     data += sizeof(struct tcpopt);
-    uint16_t *old_mss;
+    __u16 *old_mss;
     old_mss = data;
-    if (data + sizeof(uint16_t) > data_end) {
+    if (data + sizeof(__u16) > data_end) {
       return 1;
     }
-    uint16_t old_mss_value = *old_mss;
+    __u16 old_mss_value = *old_mss;
     // if old mss > new mss
-    if (ntohs(*old_mss) > new_mss_int) {
+    if (bpf_ntohs(*old_mss) > new_mss_int) {
       // set new mss
-      uint16_t new_mss = htons(new_mss_int);
-      __builtin_memcpy(old_mss, &new_mss, sizeof(uint16_t));
+      __u16 new_mss = bpf_htons(new_mss_int);
+      __builtin_memcpy(old_mss, &new_mss, sizeof(__u16));
       // recalc checksum
       update_checksum(&old_tcp_header->check, old_mss_value, new_mss);
     }
@@ -62,171 +87,170 @@ static __always_inline int update_tcp_mss(void *data, void *data_end,
   return 0;
 }
 
-SEC("xdp")
-int xdp_prog(struct xdp_md *ctx) {
-  void *data_end = (void *)(long)ctx->data_end;
-  void *data = (void *)(long)ctx->data;
-  struct ethhdr *cpy_ether_header;
-  struct ethhdr *ether_header;
-  struct ipv6hdr *ip6_header;
-  ether_header = data;
+static __always_inline struct tunnel_config *get_tunnel_config(void) {
+  __u32 key = 0;
+  return bpf_map_lookup_elem(&tunnel_config_map, &key);
+}
 
-  if (data + sizeof(*ether_header) > data_end) {
+static __always_inline int build_outer_headers(void *data, void *data_end,
+                                               struct tunnel_config *cfg) {
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end) return -1;
+  eth->h_proto = bpf_htons(ETH_P_IPV6);
+
+  struct ipv6hdr *ip6 = (void *)(eth + 1);
+  if ((void *)(ip6 + 1) > data_end) return -1;
+  ip6->version = 6;
+  ip6->priority = 0;
+  __builtin_memset(ip6->flow_lbl, 0, sizeof(ip6->flow_lbl));
+  ip6->nexthdr = ETHERIP_PROTO;
+  ip6->hop_limit = HOP_LIMIT_DEFAULT;
+  __builtin_memcpy(ip6->saddr.s6_addr, cfg->src_addr, sizeof(cfg->src_addr));
+  __builtin_memcpy(ip6->daddr.s6_addr, cfg->dst_addr, sizeof(cfg->dst_addr));
+
+  struct etherip_hdr *eip = (void *)(ip6 + 1);
+  if ((void *)(eip + 1) > data_end) return -1;
+  eip->etherip_ver = ETHERIP_VERSION;
+  eip->etherip_pad = 0x00;
+
+  ip6->payload_len = bpf_htons(data_end - (void *)eip);
+  return 0;
+}
+
+static __always_inline int clamp_inner_tcp_mss(void *data, void *data_end) {
+  struct ethhdr *inner_eth = data;
+  if ((void *)(inner_eth + 1) > data_end) return -1;
+
+  if (inner_eth->h_proto == bpf_htons(ETH_P_IP)) {
+    struct iphdr *ip = (void *)(inner_eth + 1);
+    if ((void *)(ip + 1) > data_end) return -1;
+    if (ip->protocol == 6) {
+      return update_tcp_mss((void *)(ip + 1), data_end, MSS_CLAMP_IPV4);
+    }
+  }
+
+  if (inner_eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+    struct ipv6hdr *ip6 = (void *)(inner_eth + 1);
+    if ((void *)(ip6 + 1) > data_end) return -1;
+    if (ip6->nexthdr == 6) {
+      return update_tcp_mss((void *)(ip6 + 1), data_end, MSS_CLAMP_IPV6);
+    }
+  }
+
+  return 0;
+}
+
+static __always_inline int addr_equal(__u8 *a, __u8 *b) {
+  __u64 *a64 = (__u64 *)a;
+  __u64 *b64 = (__u64 *)b;
+  return a64[0] == b64[0] && a64[1] == b64[1];
+}
+
+static __always_inline int handle_decap(struct xdp_md *ctx,
+                                        struct tunnel_config *cfg) {
+  dbg_inc(DBG_DECAP_ENTER);
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end) return XDP_ABORTED;
+  if (eth->h_proto != bpf_htons(ETH_P_IPV6)) {
+    dbg_inc(DBG_DECAP_NOT_IPV6);
+    return XDP_PASS;
+  }
+
+  struct ipv6hdr *ip6 = (void *)(eth + 1);
+  if ((void *)(ip6 + 1) + sizeof(struct etherip_hdr) > data_end)
+    return XDP_ABORTED;
+  if (ip6->nexthdr != ETHERIP_PROTO) {
+    dbg_inc(DBG_DECAP_NOT_ETHERIP);
+    return XDP_PASS;
+  }
+
+  if (addr_equal(ip6->saddr.s6_addr, cfg->src_addr)) {
+    dbg_inc(DBG_DECAP_OWN_PKT);
+    return XDP_PASS;
+  }
+
+  struct etherip_hdr *eip = (void *)(ip6 + 1);
+  if (eip->etherip_ver != ETHERIP_VERSION || eip->etherip_pad != 0x00) {
+    dbg_inc(DBG_DECAP_BAD_HEADER);
+    return XDP_PASS;
+  }
+
+  void *inner = (void *)(ip6 + 1) + sizeof(struct etherip_hdr);
+  if (inner + sizeof(struct ethhdr) > data_end) return XDP_ABORTED;
+
+  int strip_len =
+      sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct etherip_hdr);
+  bpf_xdp_adjust_head(ctx, strip_len);
+
+  data = (void *)(long)ctx->data;
+  data_end = (void *)(long)ctx->data_end;
+  struct ethhdr *inner_eth = data;
+  if ((void *)(inner_eth + 1) > data_end) return XDP_ABORTED;
+  __builtin_memcpy(inner_eth->h_dest, cfg->tunnel_mac, 6);
+
+  dbg_inc(DBG_DECAP_REDIRECT);
+  return bpf_redirect_map(&redirect_devmap, DEVMAP_TUNNEL, 0);
+}
+
+static __always_inline int handle_encap(struct xdp_md *ctx,
+                                        struct tunnel_config *cfg) {
+  dbg_inc(DBG_ENCAP_ENTER);
+  void *data = (void *)(long)ctx->data;
+  void *data_end = (void *)(long)ctx->data_end;
+
+  struct ethhdr *orig_eth = data;
+  if ((void *)(orig_eth + 1) > data_end) return XDP_ABORTED;
+
+  int outer_len = (int)(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) +
+                        sizeof(struct etherip_hdr));
+  if (bpf_xdp_adjust_head(ctx, 0 - outer_len)) {
+    dbg_inc(DBG_ENCAP_ADJUST_FAIL);
     return XDP_ABORTED;
   }
-  /*
 
-  Decap !!
+  data = (void *)(long)ctx->data;
+  data_end = (void *)(long)ctx->data_end;
 
-  */
-
-  uint16_t h_proto = ether_header->h_proto;
-
-  if (h_proto == htons(ETH_P_IPV6)) {  // Is IPv6 Packet
-
-    data += sizeof(*ether_header);
-    ip6_header = data;
-    if (data + sizeof(*ip6_header) + 2 > data_end) {
-      return XDP_ABORTED;
-    }
-    // Is EtherIP Packet
-    if (ip6_header->nexthdr == 97) {
-      data += sizeof(*ip6_header) + 2;
-      if (data + sizeof(*ip6_header) + 2 > data_end) {
-        return XDP_ABORTED;
-      }
-      struct ethhdr *etherip_ether_header;
-      etherip_ether_header = data;
-
-      bpf_xdp_adjust_head(ctx, sizeof(*ether_header) + sizeof(*ip6_header) + 2);
-      bpf_redirect(3, 0);
-      return XDP_REDIRECT;
-    }
+  if (build_outer_headers(data, data_end, cfg)) {
+    dbg_inc(DBG_ENCAP_BUILD_FAIL);
+    return XDP_ABORTED;
   }
 
-  /*
-
-  Encap !!!
-
-  */
-
-  if (ctx->ingress_ifindex == 3) {
-    data += sizeof(*ether_header);
-
-    uint16_t length = sizeof(ether_header);
-
-    //  add EtherIP over ipv6 Header
-    struct ethhdr *output_ethernet_header;
-    struct ipv6hdr *etherip_tunnel_ip6_header;
-    struct in6_addr etherip_tunnel_ip6_saddr;
-    struct in6_addr etherip_tunnel_ip6_daddr;
-
-    if (bpf_xdp_adjust_head(ctx, 0 - (int)sizeof(struct ethhdr) -
-                                     (int)sizeof(struct ipv6hdr) -
-                                     (int)sizeof(struct etherip_hdr))) {
-      return XDP_ABORTED;
-    }
-
-    data = (void *)(long)ctx->data;
-    data_end = (void *)(long)ctx->data_end;
-
-    // New Ethernet Header
-
-    if (data + sizeof(struct ethhdr) > data_end) {
-      return XDP_ABORTED;
-    }
-
-    output_ethernet_header = data;
-    // set Mac Addresses
-    uint8_t dmac[6] = {0x00, 0x60, 0xb9, 0xe6, 0x20, 0xfb};
-    uint8_t smac[6] = {0xbe, 0xfd, 0x30, 0xae, 0x56, 0xb9};
-    output_ethernet_header->h_proto = htons(ETH_P_IPV6);
-    __builtin_memcpy(output_ethernet_header->h_dest, dmac, sizeof(dmac));
-    __builtin_memcpy(output_ethernet_header->h_source, smac, sizeof(smac));
-
-    // IPv6 Header
-    data += sizeof(struct ethhdr);
-    if (data + sizeof(struct ipv6hdr) > data_end) {
-      return XDP_ABORTED;
-    }
-
-    etherip_tunnel_ip6_header = data;
-    etherip_tunnel_ip6_header->version = 6;
-    etherip_tunnel_ip6_header->priority = 0;
-    etherip_tunnel_ip6_header->nexthdr = 97;
-    etherip_tunnel_ip6_header->hop_limit = 64;
-    uint8_t saddr[16] = {0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
-    __builtin_memcpy(etherip_tunnel_ip6_saddr.s6_addr, saddr, sizeof(saddr));
-    etherip_tunnel_ip6_header->saddr = etherip_tunnel_ip6_saddr;
-    uint8_t daddr[16] = {0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-                         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02};
-    __builtin_memcpy(etherip_tunnel_ip6_daddr.s6_addr, daddr, sizeof(daddr));
-    etherip_tunnel_ip6_header->daddr = etherip_tunnel_ip6_daddr;
-
-    // EtherIP Header
-    data += sizeof(struct ipv6hdr);
-
-    struct etherip_hdr *etherip_header;
-    etherip_header = data;
-    if (data + sizeof(struct etherip_hdr) > data_end) {
-      return XDP_ABORTED;
-    }
-    etherip_header->etherip_ver = 0x30;
-    etherip_header->etherip_pad = 0x00;
-
-    etherip_tunnel_ip6_header->payload_len = htons(data_end - data);
-
-    data += sizeof(struct etherip_hdr);
-    struct ethhdr *old_ether_header;
-    old_ether_header = data;
-    if (data + sizeof(struct ethhdr) > data_end) {
-      return XDP_ABORTED;
-    }
-
-    /*
-
-     TCP adjust MSS
-
-    */
-
-    // if IPv4
-    if (old_ether_header->h_proto == htons(ETH_P_IP)) {
-      data += sizeof(struct ethhdr);
-      struct iphdr *old_ip_header;
-      old_ip_header = data;
-      if (data + sizeof(struct iphdr) > data_end) {
-        return XDP_ABORTED;
-      }
-
-      // if TCP
-      if (old_ip_header->protocol == 6) {
-        data += sizeof(struct iphdr);
-        if (update_tcp_mss(data, data_end, 1404)) {
-          return XDP_ABORTED;
-        }
-      }
-    }
-    // if IPv6
-    if (old_ether_header->h_proto == htons(ETH_P_IPV6)) {
-      data += sizeof(struct ethhdr);
-      struct ipv6hdr *old_ip6_header;
-      old_ip6_header = data;
-      if (data + sizeof(struct ipv6hdr) > data_end) {
-        return XDP_ABORTED;
-      }
-      // if TCP
-      if (old_ip6_header->nexthdr == 6) {
-        data += sizeof(struct ipv6hdr);
-        if (update_tcp_mss(data, data_end, 1384) == 1) {
-          return XDP_ABORTED;
-        }
-      }
-    }
-    bpf_redirect(2, 0);
-    return XDP_REDIRECT;
+  void *inner = data + outer_len;
+  if (clamp_inner_tcp_mss(inner, data_end)) {
+    dbg_inc(DBG_ENCAP_MSS_FAIL);
+    return XDP_ABORTED;
   }
-  return XDP_PASS;
+
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end) {
+    dbg_inc(DBG_ENCAP_BOUNDS_FAIL);
+    return XDP_ABORTED;
+  }
+
+  __builtin_memcpy(eth->h_dest, cfg->dst_mac, 6);
+  __builtin_memcpy(eth->h_source, cfg->external_mac, 6);
+
+  dbg_inc(DBG_ENCAP_REDIRECT);
+  return bpf_redirect_map(&redirect_devmap, DEVMAP_EXTERNAL, 0);
+}
+
+SEC("xdp")
+int xdp_prog(struct xdp_md *ctx) {
+  dbg_inc(DBG_MAIN_ENTER);
+  struct tunnel_config *cfg = get_tunnel_config();
+  if (!cfg) {
+    dbg_inc(DBG_MAIN_NO_CFG);
+    return XDP_ABORTED;
+  }
+
+  if (ctx->ingress_ifindex == cfg->internal_ifindex)
+    return handle_encap(ctx, cfg);
+
+  return handle_decap(ctx, cfg);
 }
 
 char __license[] SEC("license") = "Dual MIT/GPL";
