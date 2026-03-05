@@ -2,18 +2,23 @@
 #define XDP_PROG_H
 #include <linux/types.h>
 
-#define MSS_CLAMP_IPV4 1404
-#define MSS_CLAMP_IPV6 1384
 #define ETHERIP_PROTO 97
 #define HOP_LIMIT_DEFAULT 64
 #define ETHERIP_VERSION 0x30
 #define DEVMAP_EXTERNAL 0
 #define DEVMAP_TUNNEL 1
+#define MAX_EXT_HEADERS 6
+#define MAX_TCP_OPT_ITERATIONS 10
 
 // tcp options
 struct tcpopt {
   __u8 kind;
   __u8 len;
+};
+
+struct ipv6_ext_hdr {
+  __u8 nexthdr;
+  __u8 hdrlen;
 };
 
 // EtherIP header
@@ -32,6 +37,8 @@ struct tunnel_config {
   __u8 internal_mac[6];
   __u8 external_mac[6];
   __u8 dst_mac[6];
+  __u16 mss_clamp_ipv4;
+  __u16 mss_clamp_ipv6;
 };
 
 enum debug_counter {

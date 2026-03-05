@@ -18,21 +18,27 @@ type TunnelConfig struct {
 	InternalMAC     [6]byte
 	ExternalMAC     [6]byte
 	DstMAC          [6]byte
+	MSSClampIPv4    uint16
+	MSSClampIPv6    uint16
+}
+
+const (
+	ipv4HeaderLen = 20
+	ipv6HeaderLen = 40
+	tcpHeaderLen  = 20
+)
+
+func ComputeMSSClamp(tunnelMTU int) (uint16, uint16) {
+	return uint16(tunnelMTU - ipv4HeaderLen - tcpHeaderLen),
+		uint16(tunnelMTU - ipv6HeaderLen - tcpHeaderLen)
 }
 
 func ReadCollection() (*xdpObjects, error) {
 	obj := &xdpObjects{}
-	// TODO: BPF log level remove hardcoding. yaml in config?
-	err := loadXdpObjects(obj, &ebpf.CollectionOptions{
-		Programs: ebpf.ProgramOptions{
-			LogLevel: 2,
-			LogSizeStart: 102400 * 1024,
-		},
-	})
+	err := loadXdpObjects(obj, nil)
 	if err != nil {
 		return nil, fmt.Errorf("load xdp objects: %w", err)
 	}
-
 	return obj, nil
 }
 

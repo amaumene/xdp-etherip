@@ -2,7 +2,6 @@
 
 #include <linux/bpf.h>
 #include <linux/if_ether.h>
-#include <linux/if_vlan.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/tcp.h>
@@ -36,6 +35,25 @@ static __always_inline void dbg_inc(__u32 idx) {
   if (val) __sync_fetch_and_add(val, 1);
 }
 
+static __always_inline int skip_ext_headers(void *data_end, void **pos,
+                                            __u8 *nexthdr) {
+#pragma unroll
+  for (int i = 0; i < MAX_EXT_HEADERS; i++) {
+    if (*nexthdr != 0 && *nexthdr != 43 && *nexthdr != 44 && *nexthdr != 60)
+      return 0;
+    __u8 cur = *nexthdr;
+    struct ipv6_ext_hdr *ext = *pos;
+    if ((void *)(ext + 1) > data_end) return -1;
+    *nexthdr = ext->nexthdr;
+    if (cur == 44)
+      *pos += 8;
+    else
+      *pos += (ext->hdrlen + 1) * 8;
+    if (*pos > data_end) return -1;
+  }
+  return 0;
+}
+
 static __always_inline void update_checksum(__u16 *csum, __u16 old_val,
                                             __u16 new_val) {
   __u32 new_csum_value;
@@ -52,37 +70,39 @@ static __always_inline void update_checksum(__u16 *csum, __u16 old_val,
 
 static __always_inline int update_tcp_mss(void *data, void *data_end,
                                           int new_mss_int) {
-  struct tcphdr *old_tcp_header;
-  old_tcp_header = data;
-  if (data + sizeof(struct tcphdr) > data_end) {
-    return 1;
-  }
-  // if SYN
-  if (old_tcp_header->syn == 1) {
-    data += sizeof(struct tcphdr);
-  }
-  struct tcpopt *old_tcp_options;
-  old_tcp_options = data;
-  if (data + sizeof(struct tcpopt) > data_end) {
-    return 1;
-  }
-  // if MSS
-  if (old_tcp_options->kind == 2 && old_tcp_options->len == 4) {
-    data += sizeof(struct tcpopt);
-    __u16 *old_mss;
-    old_mss = data;
-    if (data + sizeof(__u16) > data_end) {
-      return 1;
+  struct tcphdr *tcp = data;
+  if (data + sizeof(struct tcphdr) > data_end) return 1;
+  if (tcp->syn != 1) return 0;
+
+  __u8 doff = tcp->doff;
+  if (doff < 5) return 0;
+  if (data + (__u32)doff * 4 > data_end) return 1;
+
+  int remaining = doff * 4 - (int)sizeof(struct tcphdr);
+  void *opt_ptr = data + sizeof(struct tcphdr);
+
+  for (int i = 0; i < MAX_TCP_OPT_ITERATIONS; i++) {
+    if (remaining < 1 || opt_ptr + 1 > data_end) break;
+    __u8 kind = *(__u8 *)opt_ptr;
+    if (kind == 0) break;
+    if (kind == 1) { opt_ptr += 1; remaining -= 1; continue; }
+    if (remaining < 2 || opt_ptr + 2 > data_end) break;
+    __u8 len = *(__u8 *)(opt_ptr + 1);
+    if (len < 2 || len > remaining || opt_ptr + len > data_end) break;
+    if (kind == 2 && len == 4) {
+      asm volatile("" : "+r"(opt_ptr));
+      if (opt_ptr + 4 > data_end) return 1;
+      __u16 *mss_val = (__u16 *)(opt_ptr + 2);
+      __u16 old_mss = *mss_val;
+      if (bpf_ntohs(old_mss) > new_mss_int) {
+        __u16 new_mss = bpf_htons(new_mss_int);
+        __builtin_memcpy(mss_val, &new_mss, sizeof(__u16));
+        update_checksum(&tcp->check, old_mss, new_mss);
+      }
+      return 0;
     }
-    __u16 old_mss_value = *old_mss;
-    // if old mss > new mss
-    if (bpf_ntohs(*old_mss) > new_mss_int) {
-      // set new mss
-      __u16 new_mss = bpf_htons(new_mss_int);
-      __builtin_memcpy(old_mss, &new_mss, sizeof(__u16));
-      // recalc checksum
-      update_checksum(&old_tcp_header->check, old_mss_value, new_mss);
-    }
+    opt_ptr += len;
+    remaining -= len;
   }
   return 0;
 }
@@ -117,7 +137,8 @@ static __always_inline int build_outer_headers(void *data, void *data_end,
   return 0;
 }
 
-static __always_inline int clamp_inner_tcp_mss(void *data, void *data_end) {
+static __always_inline int clamp_inner_tcp_mss(void *data, void *data_end,
+                                                struct tunnel_config *cfg) {
   struct ethhdr *inner_eth = data;
   if ((void *)(inner_eth + 1) > data_end) return -1;
 
@@ -125,15 +146,18 @@ static __always_inline int clamp_inner_tcp_mss(void *data, void *data_end) {
     struct iphdr *ip = (void *)(inner_eth + 1);
     if ((void *)(ip + 1) > data_end) return -1;
     if (ip->protocol == 6) {
-      return update_tcp_mss((void *)(ip + 1), data_end, MSS_CLAMP_IPV4);
+      return update_tcp_mss((void *)(ip + 1), data_end, cfg->mss_clamp_ipv4);
     }
   }
 
   if (inner_eth->h_proto == bpf_htons(ETH_P_IPV6)) {
     struct ipv6hdr *ip6 = (void *)(inner_eth + 1);
     if ((void *)(ip6 + 1) > data_end) return -1;
-    if (ip6->nexthdr == 6) {
-      return update_tcp_mss((void *)(ip6 + 1), data_end, MSS_CLAMP_IPV6);
+    __u8 nexthdr = ip6->nexthdr;
+    void *pos = (void *)(ip6 + 1);
+    if (skip_ext_headers(data_end, &pos, &nexthdr)) return -1;
+    if (nexthdr == 6) {
+      return update_tcp_mss(pos, data_end, cfg->mss_clamp_ipv6);
     }
   }
 
@@ -141,9 +165,7 @@ static __always_inline int clamp_inner_tcp_mss(void *data, void *data_end) {
 }
 
 static __always_inline int addr_equal(__u8 *a, __u8 *b) {
-  __u64 *a64 = (__u64 *)a;
-  __u64 *b64 = (__u64 *)b;
-  return a64[0] == b64[0] && a64[1] == b64[1];
+  return __builtin_memcmp(a, b, 16) == 0;
 }
 
 static __always_inline int handle_decap(struct xdp_md *ctx,
@@ -160,9 +182,13 @@ static __always_inline int handle_decap(struct xdp_md *ctx,
   }
 
   struct ipv6hdr *ip6 = (void *)(eth + 1);
-  if ((void *)(ip6 + 1) + sizeof(struct etherip_hdr) > data_end)
-    return XDP_ABORTED;
-  if (ip6->nexthdr != ETHERIP_PROTO) {
+  if ((void *)(ip6 + 1) > data_end) return XDP_ABORTED;
+
+  __u8 nexthdr = ip6->nexthdr;
+  void *pos = (void *)(ip6 + 1);
+  if (skip_ext_headers(data_end, &pos, &nexthdr)) return XDP_ABORTED;
+
+  if (nexthdr != ETHERIP_PROTO) {
     dbg_inc(DBG_DECAP_NOT_ETHERIP);
     return XDP_PASS;
   }
@@ -172,18 +198,18 @@ static __always_inline int handle_decap(struct xdp_md *ctx,
     return XDP_PASS;
   }
 
-  struct etherip_hdr *eip = (void *)(ip6 + 1);
+  struct etherip_hdr *eip = pos;
+  if ((void *)(eip + 1) > data_end) return XDP_ABORTED;
   if (eip->etherip_ver != ETHERIP_VERSION || eip->etherip_pad != 0x00) {
     dbg_inc(DBG_DECAP_BAD_HEADER);
     return XDP_PASS;
   }
 
-  void *inner = (void *)(ip6 + 1) + sizeof(struct etherip_hdr);
-  if (inner + sizeof(struct ethhdr) > data_end) return XDP_ABORTED;
+  if ((void *)(eip + 1) + sizeof(struct ethhdr) > data_end)
+    return XDP_ABORTED;
 
-  int strip_len =
-      sizeof(struct ethhdr) + sizeof(struct ipv6hdr) + sizeof(struct etherip_hdr);
-  bpf_xdp_adjust_head(ctx, strip_len);
+  int strip_len = (int)((void *)(eip + 1) - data);
+  if (bpf_xdp_adjust_head(ctx, strip_len)) return XDP_ABORTED;
 
   data = (void *)(long)ctx->data;
   data_end = (void *)(long)ctx->data_end;
@@ -220,7 +246,7 @@ static __always_inline int handle_encap(struct xdp_md *ctx,
   }
 
   void *inner = data + outer_len;
-  if (clamp_inner_tcp_mss(inner, data_end)) {
+  if (clamp_inner_tcp_mss(inner, data_end, cfg)) {
     dbg_inc(DBG_ENCAP_MSS_FAIL);
     return XDP_ABORTED;
   }

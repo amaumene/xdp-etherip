@@ -181,7 +181,9 @@ func setupTestTunnelConfig(t *testing.T, m *ebpf.Map) {
 		TunnelMAC:   testExternalMAC,
 		InternalMAC: testExternalMAC,
 		ExternalMAC: testExternalMAC,
-		DstMAC:      testDstMAC,
+		DstMAC:       testDstMAC,
+		MSSClampIPv4: 1404,
+		MSSClampIPv6: 1384,
 	}
 	copy(cfg.SrcAddr[:], net.ParseIP("fe80::1").To16())
 	copy(cfg.DstAddr[:], net.ParseIP("fe80::2").To16())

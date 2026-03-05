@@ -122,7 +122,7 @@ func resolveNeighborMAC(ifindex int, ip net.IP) ([6]byte, error) {
 	return [6]byte{}, fmt.Errorf("no neighbor entry for %s", ip)
 }
 
-func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string) (coreelf.TunnelConfig, error) {
+func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU int) (coreelf.TunnelConfig, error) {
 	externalDev := cmd.String("external")
 	externalIdx, err := resolveIfindex(externalDev)
 	if err != nil {
@@ -165,6 +165,7 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string) (coreelf.Tun
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
+	mssV4, mssV6 := coreelf.ComputeMSSClamp(tunnelMTU)
 	return coreelf.TunnelConfig{
 		SrcAddr:         srcAddr,
 		DstAddr:         dstAddr,
@@ -175,6 +176,8 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string) (coreelf.Tun
 		InternalMAC:     xdpEndMAC,
 		ExternalMAC:     externalMAC,
 		DstMAC:          dstMAC,
+		MSSClampIPv4:    mssV4,
+		MSSClampIPv6:    mssV6,
 	}, nil
 }
 
@@ -246,27 +249,27 @@ func loadAndAttach(externalDev string, cfg *coreelf.TunnelConfig, xdpEnd string)
 	return devices, obj.DebugCounters, nil
 }
 
-func setupTunnel(cmd *cli.Command) (string, string, error) {
+func setupTunnel(cmd *cli.Command) (string, string, int, error) {
 	tunnelName := cmd.String("tunnel")
 	tunnelMTU, err := xdptool.TunnelMTU(cmd.String("external"))
 	if err != nil {
-		return "", "", fmt.Errorf("compute tunnel mtu: %w", err)
+		return "", "", 0, fmt.Errorf("compute tunnel mtu: %w", err)
 	}
 	xdpEnd, err := xdptool.CreateVethPair(tunnelName, tunnelMTU)
 	if err != nil {
-		return "", "", fmt.Errorf("create veth pair: %w", err)
+		return "", "", 0, fmt.Errorf("create veth pair: %w", err)
 	}
 	log.Printf("created veth pair: %s <-> %s (mtu %d)", tunnelName, xdpEnd, tunnelMTU)
-	return tunnelName, xdpEnd, nil
+	return tunnelName, xdpEnd, tunnelMTU, nil
 }
 
 func run(ctx context.Context, cmd *cli.Command) error {
-	tunnelName, xdpEnd, err := setupTunnel(cmd)
+	tunnelName, xdpEnd, tunnelMTU, err := setupTunnel(cmd)
 	if err != nil {
 		return err
 	}
 	time.Sleep(500 * time.Millisecond)
-	cfg, err := buildTunnelConfig(cmd, tunnelName, xdpEnd)
+	cfg, err := buildTunnelConfig(cmd, tunnelName, xdpEnd, tunnelMTU)
 	if err != nil {
 		return err
 	}

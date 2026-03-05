@@ -22,10 +22,10 @@ gen:
 
 .PHONY: container-build
 container-build:
-	podman build --platform linux/arm64 -f Containerfile -t $(NAME)-openwrt .
+	podman build --platform linux/arm64 -f Containerfile -t $(NAME)-static .
 	mkdir -p bin
-	podman create --name $(NAME)-extract $(NAME)-openwrt
-	podman cp $(NAME)-extract:/$(NAME) bin/$(NAME)-openwrt-aarch64
+	podman create --name $(NAME)-extract $(NAME)-static
+	podman cp $(NAME)-extract:/$(NAME) bin/$(NAME)-static-aarch64
 	podman rm $(NAME)-extract
 
 .PHONY: clean
