@@ -165,29 +165,19 @@ func bringUpLink(name string) error {
 	return nil
 }
 
-func Attach(prog *ebpf.Program, device string) (bool, error) {
+func Attach(prog *ebpf.Program, device string) (bool, error, error) {
 	link, err := netlink.LinkByName(device)
 	if err != nil {
-		return false, fmt.Errorf("%s not found: %w", device, err)
+		return false, nil, fmt.Errorf("%s not found: %w", device, err)
 	}
-	if err := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), xdpFlagsDRVMode); err == nil {
-		return true, nil
-	}
-	if err := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), xdpFlagsSKBMode); err != nil {
-		return false, fmt.Errorf("attach %s: %w", device, err)
-	}
-	return false, nil
-}
-
-func AttachGeneric(prog *ebpf.Program, device string) error {
-	link, err := netlink.LinkByName(device)
-	if err != nil {
-		return fmt.Errorf("%s not found: %w", device, err)
+	nativeErr := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), xdpFlagsDRVMode)
+	if nativeErr == nil {
+		return true, nil, nil
 	}
 	if err := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), xdpFlagsSKBMode); err != nil {
-		return fmt.Errorf("attach %s: %w", device, err)
+		return false, nativeErr, fmt.Errorf("attach %s: %w", device, err)
 	}
-	return nil
+	return false, nativeErr, nil
 }
 
 func Detach(device string) error {

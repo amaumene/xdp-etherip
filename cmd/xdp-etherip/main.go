@@ -181,11 +181,16 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU in
 	}, nil
 }
 
-func attachInternalGeneric(prog *ebpf.Program, dev string) error {
-	if err := xdptool.AttachGeneric(prog, dev); err != nil {
+func attachDevice(prog *ebpf.Program, dev string) error {
+	isNative, nativeErr, err := xdptool.Attach(prog, dev)
+	if err != nil {
 		return fmt.Errorf("attach %s: %w", dev, err)
 	}
-	log.Printf("attached device: %s (generic/SKB)", dev)
+	if isNative {
+		log.Printf("attached device: %s (native/driver)", dev)
+	} else {
+		log.Printf("attached device: %s (generic/SKB, native failed: %v)", dev, nativeErr)
+	}
 	return nil
 }
 
@@ -233,10 +238,10 @@ func loadAndAttach(externalDev string, cfg *coreelf.TunnelConfig, xdpEnd string)
 	if err != nil {
 		return nil, nil, fmt.Errorf("load ebpf: %w", err)
 	}
-	if err := attachInternalGeneric(obj.XdpProg, externalDev); err != nil {
+	if err := attachDevice(obj.XdpProg, externalDev); err != nil {
 		return nil, nil, err
 	}
-	if err := attachInternalGeneric(obj.XdpProg, xdpEnd); err != nil {
+	if err := attachDevice(obj.XdpProg, xdpEnd); err != nil {
 		return nil, nil, err
 	}
 	devices := []string{externalDev, xdpEnd}
