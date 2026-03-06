@@ -7,8 +7,11 @@ import (
 	"unsafe"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"github.com/vishvananda/netlink"
 )
+
+const xdpPass = 2
 
 const (
 	ifnamsiz         = 15
@@ -165,11 +168,25 @@ func bringUpLink(name string) error {
 	return nil
 }
 
+func CreatePassProg() (*ebpf.Program, error) {
+	spec := &ebpf.ProgramSpec{
+		Type: ebpf.XDP,
+		Instructions: asm.Instructions{
+			asm.Mov.Imm(asm.R0, xdpPass),
+			asm.Return(),
+		},
+		License: "Dual MIT/GPL",
+	}
+	return ebpf.NewProgram(spec)
+}
+
 func Attach(prog *ebpf.Program, device string) (bool, error, error) {
 	link, err := netlink.LinkByName(device)
 	if err != nil {
 		return false, nil, fmt.Errorf("%s not found: %w", device, err)
 	}
+	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsSKBMode)
+	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsDRVMode)
 	nativeErr := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), xdpFlagsDRVMode)
 	if nativeErr == nil {
 		return true, nil, nil
