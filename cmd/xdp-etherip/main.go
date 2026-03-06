@@ -122,6 +122,39 @@ func resolveNeighborMAC(ifindex int, ip net.IP) ([6]byte, error) {
 	return [6]byte{}, fmt.Errorf("no neighbor entry for %s", ip)
 }
 
+const (
+	maxRetries = 10
+	retryDelay = 500 * time.Millisecond
+)
+
+func resolveDstMAC(externalIdx uint32, dstIP net.IP) ([6]byte, error) {
+	var nextHop net.IP
+	var err error
+	for i := range maxRetries {
+		if nextHop, err = resolveNextHop(dstIP); err == nil {
+			break
+		}
+		if i < maxRetries-1 {
+			log.Printf("retry route %d/%d: %v", i+1, maxRetries, err)
+			time.Sleep(retryDelay * time.Duration(i+1))
+		}
+	}
+	if err != nil {
+		return [6]byte{}, err
+	}
+	var mac [6]byte
+	for i := range maxRetries {
+		if mac, err = resolveNeighborMAC(int(externalIdx), nextHop); err == nil {
+			return mac, nil
+		}
+		if i < maxRetries-1 {
+			log.Printf("retry neighbor %d/%d: %v", i+1, maxRetries, err)
+			time.Sleep(retryDelay * time.Duration(i+1))
+		}
+	}
+	return mac, err
+}
+
 func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU int) (coreelf.TunnelConfig, error) {
 	externalDev := cmd.String("external")
 	externalIdx, err := resolveIfindex(externalDev)
@@ -129,10 +162,6 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU in
 		return coreelf.TunnelConfig{}, err
 	}
 	internalIdx, err := resolveIfindex(xdpEnd)
-	if err != nil {
-		return coreelf.TunnelConfig{}, err
-	}
-	tunnelIdx, err := resolveIfindex(tunnelName)
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
@@ -144,6 +173,7 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU in
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
+	dstIP := net.IP(dstAddr[:])
 	tunnelMAC, err := getInterfaceMAC(tunnelName)
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
@@ -156,12 +186,7 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU in
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
-	dstIP := net.ParseIP(cmd.String("dst-ip6"))
-	nextHop, err := resolveNextHop(dstIP)
-	if err != nil {
-		return coreelf.TunnelConfig{}, err
-	}
-	dstMAC, err := resolveNeighborMAC(int(externalIdx), nextHop)
+	dstMAC, err := resolveDstMAC(externalIdx, dstIP)
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
@@ -171,7 +196,6 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU in
 		DstAddr:         dstAddr,
 		InternalIfindex: internalIdx,
 		ExternalIfindex: externalIdx,
-		TunnelIfindex:   tunnelIdx,
 		TunnelMAC:       tunnelMAC,
 		InternalMAC:     xdpEndMAC,
 		ExternalMAC:     externalMAC,
@@ -182,14 +206,14 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU in
 }
 
 func attachDevice(prog *ebpf.Program, dev string) error {
-	isNative, nativeErr, err := xdptool.Attach(prog, dev)
+	isNative, err := xdptool.Attach(prog, dev)
 	if err != nil {
 		return fmt.Errorf("attach %s: %w", dev, err)
 	}
 	if isNative {
 		log.Printf("attached device: %s (native/driver)", dev)
 	} else {
-		log.Printf("attached device: %s (generic/SKB, native failed: %v)", dev, nativeErr)
+		log.Printf("attached device: %s (generic/SKB)", dev)
 	}
 	return nil
 }
@@ -268,12 +292,18 @@ func setupTunnel(cmd *cli.Command) (string, string, int, error) {
 	return tunnelName, xdpEnd, tunnelMTU, nil
 }
 
-func run(ctx context.Context, cmd *cli.Command) error {
+func run(ctx context.Context, cmd *cli.Command) (retErr error) {
 	tunnelName, xdpEnd, tunnelMTU, err := setupTunnel(cmd)
 	if err != nil {
 		return err
 	}
-	time.Sleep(500 * time.Millisecond)
+	defer func() {
+		if retErr != nil {
+			if delErr := xdptool.DeleteVethPair(tunnelName); delErr != nil {
+				log.Printf("cleanup veth %s: %v", tunnelName, delErr)
+			}
+		}
+	}()
 	cfg, err := buildTunnelConfig(cmd, tunnelName, xdpEnd, tunnelMTU)
 	if err != nil {
 		return err

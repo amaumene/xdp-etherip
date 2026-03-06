@@ -29,7 +29,7 @@ const (
 	ifreqSize          = 40
 )
 
-func XDPPeerName(name string) string {
+func xdpPeerName(name string) string {
 	return name + xdpPeerSuffix
 }
 
@@ -112,17 +112,24 @@ func configureVethPair(name, peerName string, mtu int) error {
 	if err := bringUpLink(name); err != nil {
 		return err
 	}
-	if err := bringUpLink(peerName); err != nil {
-		return err
+	return bringUpLink(peerName)
+}
+
+func deleteIfExists(name string) {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		return
 	}
-	return nil
+	netlink.LinkDel(link)
 }
 
 func CreateVethPair(name string, mtu int) (string, error) {
-	peerName := XDPPeerName(name)
+	peerName := xdpPeerName(name)
 	if err := validateVethNames(name, peerName); err != nil {
 		return "", err
 	}
+	deleteIfExists(name)
+	deleteIfExists(peerName)
 	veth := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{Name: name},
 		PeerName:  peerName,
@@ -180,21 +187,21 @@ func CreatePassProg() (*ebpf.Program, error) {
 	return ebpf.NewProgram(spec)
 }
 
-func Attach(prog *ebpf.Program, device string) (bool, error, error) {
+func Attach(prog *ebpf.Program, device string) (bool, error) {
 	link, err := netlink.LinkByName(device)
 	if err != nil {
-		return false, nil, fmt.Errorf("%s not found: %w", device, err)
+		return false, fmt.Errorf("%s not found: %w", device, err)
 	}
 	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsSKBMode)
 	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsDRVMode)
 	nativeErr := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), xdpFlagsDRVMode)
 	if nativeErr == nil {
-		return true, nil, nil
+		return true, nil
 	}
 	if err := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), xdpFlagsSKBMode); err != nil {
-		return false, nativeErr, fmt.Errorf("attach %s: %w", device, err)
+		return false, fmt.Errorf("attach %s (native: %v): %w", device, nativeErr, err)
 	}
-	return false, nativeErr, nil
+	return false, nil
 }
 
 func Detach(device string) error {

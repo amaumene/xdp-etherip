@@ -177,7 +177,7 @@ var (
 func setupTestTunnelConfig(t *testing.T, m *ebpf.Map) {
 	t.Helper()
 	cfg := coreelf.TunnelConfig{
-		InternalIfindex: 3, ExternalIfindex: 2, TunnelIfindex: 4,
+		InternalIfindex: 3, ExternalIfindex: 2,
 		TunnelMAC:   testExternalMAC,
 		InternalMAC: testExternalMAC,
 		ExternalMAC: testExternalMAC,

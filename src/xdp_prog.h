@@ -10,12 +10,6 @@
 #define MAX_EXT_HEADERS 6
 #define MAX_TCP_OPT_ITERATIONS 10
 
-// tcp options
-struct tcpopt {
-  __u8 kind;
-  __u8 len;
-};
-
 struct ipv6_ext_hdr {
   __u8 nexthdr;
   __u8 hdrlen;
@@ -32,7 +26,6 @@ struct tunnel_config {
   __u8 dst_addr[16];
   __u32 internal_ifindex;
   __u32 external_ifindex;
-  __u32 tunnel_ifindex;
   __u8 tunnel_mac[6];
   __u8 internal_mac[6];
   __u8 external_mac[6];

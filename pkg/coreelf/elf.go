@@ -13,7 +13,6 @@ type TunnelConfig struct {
 	DstAddr         [16]byte
 	InternalIfindex uint32
 	ExternalIfindex uint32
-	TunnelIfindex   uint32
 	TunnelMAC       [6]byte
 	InternalMAC     [6]byte
 	ExternalMAC     [6]byte

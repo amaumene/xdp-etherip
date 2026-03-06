@@ -1,6 +1,6 @@
 NAME := xdp-etherip
 
-#brunch name version
+#branch name version
 VERSION := $(shell git rev-parse --abbrev-ref HEAD)
 
 PKG_NAME=$(shell basename `pwd`)
