@@ -71,7 +71,26 @@ func generateIPv4TCPInput(t *testing.T) []byte {
 	return buf.Bytes()
 }
 
-func generateIPv4TCPOutput(t *testing.T) []byte {
+// innerFlowHash mirrors the BPF inner_flow_hash function: polynomial hash
+// of the inner Ethernet header (dst MAC, src MAC, EtherType) masked to 20 bits.
+func innerFlowHash(pkt []byte) uint32 {
+	if len(pkt) < 14 {
+		return 0
+	}
+	var h uint32
+	for i := 0; i < 6; i++ {
+		h = h*31 + uint32(pkt[i]) // h_dest
+	}
+	for i := 6; i < 12; i++ {
+		h = h*31 + uint32(pkt[i]) // h_source
+	}
+	// h_proto in host byte order (bpf_ntohs of the network-order value)
+	proto := uint32(pkt[12])<<8 | uint32(pkt[13])
+	h = h*31 + proto
+	return h & 0xFFFFF
+}
+
+func generateIPv4TCPOutput(t *testing.T, input []byte) []byte {
 
 	t.Helper()
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
@@ -81,6 +100,7 @@ func generateIPv4TCPOutput(t *testing.T) []byte {
 		Version:    6,
 		NextHeader: layers.IPProtocolEtherIP,
 		HopLimit:   64,
+		FlowLabel:  innerFlowHash(input),
 		SrcIP:      net.ParseIP("fe80::1"),
 		DstIP:      net.ParseIP("fe80::2"),
 	}
@@ -178,9 +198,8 @@ func setupTestTunnelConfig(t *testing.T, m *ebpf.Map) {
 	t.Helper()
 	cfg := coreelf.TunnelConfig{
 		InternalIfindex: 3, ExternalIfindex: 2,
-		TunnelMAC:   testExternalMAC,
-		InternalMAC: testExternalMAC,
-		ExternalMAC: testExternalMAC,
+		TunnelMAC:    testExternalMAC,
+		ExternalMAC:  testExternalMAC,
 		DstMAC:       testDstMAC,
 		MSSClampIPv4: 1404,
 		MSSClampIPv6: 1384,
@@ -233,7 +252,7 @@ func TestXDPProg(t *testing.T) {
 		t.Errorf("got %d, want XDP_REDIRECT(4)", ret)
 	}
 
-	want := generateIPv4TCPOutput(t)
+	want := generateIPv4TCPOutput(t, input)
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Logf("input: %x", input)
 		t.Logf("output: %x", got)

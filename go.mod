@@ -1,3 +1,5 @@
+// Module path kept as upstream (x86taka) for import compatibility.
+// The Containerfile uses a replace directive for the amaumene fork.
 module github.com/x86taka/xdp-etherip
 
 go 1.24.0

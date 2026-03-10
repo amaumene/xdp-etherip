@@ -14,9 +14,9 @@ type TunnelConfig struct {
 	InternalIfindex uint32
 	ExternalIfindex uint32
 	TunnelMAC       [6]byte
-	InternalMAC     [6]byte
 	ExternalMAC     [6]byte
 	DstMAC          [6]byte
+	Pad             [2]byte
 	MSSClampIPv4    uint16
 	MSSClampIPv6    uint16
 }
@@ -92,11 +92,13 @@ var DebugCounterNames = [DbgMax]string{
 func ReadDebugCounters(m *ebpf.Map) ([DbgMax]uint64, error) {
 	var counters [DbgMax]uint64
 	for i := uint32(0); i < DbgMax; i++ {
-		var val uint64
-		if err := m.Lookup(i, &val); err != nil {
+		var vals []uint64
+		if err := m.Lookup(i, &vals); err != nil {
 			return counters, fmt.Errorf("read counter %d: %w", i, err)
 		}
-		counters[i] = val
+		for _, v := range vals {
+			counters[i] += v
+		}
 	}
 	return counters, nil
 }

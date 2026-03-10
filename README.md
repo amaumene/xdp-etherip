@@ -50,9 +50,9 @@ the veth peer via DEVMAP, which delivers them to the tunnel interface.
 The tunnel MTU is computed automatically:
 ```
 tunnel_mtu = external_mtu - 56
-                             ├── outer Ethernet:  14 bytes
                              ├── IPv6 header:     40 bytes
-                             └── EtherIP header:   2 bytes
+                             ├── EtherIP header:   2 bytes
+                             └── inner Ethernet:  14 bytes
 ```
 
 ### Why XDP_PASS on the tunnel interface

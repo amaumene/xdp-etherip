@@ -14,11 +14,11 @@ import (
 const xdpPass = 2
 
 const (
-	ifnamsiz         = 15
-	xdpPeerSuffix    = "-xdp"
-	xdpFlagsDRVMode  = 1 << 2
-	xdpFlagsSKBMode  = 1 << 1
-	tunnelOverhead   = 56 // outer IPv6 (40) + EtherIP (2) + inner Ethernet (14)
+	ifnamsiz           = 15
+	xdpPeerSuffix      = "-xdp"
+	xdpFlagsDRVMode    = 1 << 2
+	xdpFlagsSKBMode    = 1 << 1
+	tunnelOverhead     = 56 // outer IPv6 (40) + EtherIP (2) + inner Ethernet (14)
 	siocETHTOOL        = 0x8946
 	ethtoolGetFeatures = 0x3a
 	ethtoolSetFeatures = 0x3b
@@ -26,7 +26,6 @@ const (
 	netifFIPCsumBit    = 1
 	netifFHWCsumBit    = 3
 	netifFIPV6CsumBit  = 4
-	ifreqSize          = 40
 )
 
 func xdpPeerName(name string) string {
@@ -89,10 +88,15 @@ func clearTxChecksum(fd int, name string, words uint32) error {
 }
 
 func ethtoolIoctl(fd int, name string, data []byte) error {
-	var ifr [ifreqSize]byte
-	copy(ifr[:], name)
-	*(*uintptr)(unsafe.Pointer(&ifr[16])) = uintptr(unsafe.Pointer(&data[0]))
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), siocETHTOOL, uintptr(unsafe.Pointer(&ifr)))
+	type ifreq struct {
+		name [16]byte
+		data unsafe.Pointer
+		_pad [16]byte // fill to 40 bytes (sizeof struct ifreq)
+	}
+	var req ifreq
+	copy(req.name[:], name)
+	req.data = unsafe.Pointer(&data[0])
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), siocETHTOOL, uintptr(unsafe.Pointer(&req)))
 	if errno != 0 {
 		return errno
 	}

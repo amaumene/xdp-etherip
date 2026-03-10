@@ -27,9 +27,9 @@ struct tunnel_config {
   __u32 internal_ifindex;
   __u32 external_ifindex;
   __u8 tunnel_mac[6];
-  __u8 internal_mac[6];
   __u8 external_mac[6];
   __u8 dst_mac[6];
+  __u8 _pad[2];
   __u16 mss_clamp_ipv4;
   __u16 mss_clamp_ipv6;
 };

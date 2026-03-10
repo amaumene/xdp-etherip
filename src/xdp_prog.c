@@ -17,7 +17,7 @@ struct {
 } tunnel_config_map SEC(".maps");
 
 struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, DBG_MAX);
   __type(key, __u32);
   __type(value, __u64);
@@ -32,7 +32,7 @@ struct {
 
 static __always_inline void dbg_inc(__u32 idx) {
   __u64 *val = bpf_map_lookup_elem(&debug_counters, &idx);
-  if (val) __sync_fetch_and_add(val, 1);
+  if (val) (*val)++;
 }
 
 static __always_inline int skip_ext_headers(void *data_end, void **pos,
@@ -107,13 +107,28 @@ static __always_inline int update_tcp_mss(void *data, void *data_end,
   return 0;
 }
 
+static __always_inline __u32 inner_flow_hash(void *data, void *data_end) {
+  struct ethhdr *eth = data;
+  if ((void *)(eth + 1) > data_end) return 0;
+  __u32 h = 0;
+#pragma unroll
+  for (int i = 0; i < 6; i++)
+    h = h * 31 + eth->h_dest[i];
+#pragma unroll
+  for (int i = 0; i < 6; i++)
+    h = h * 31 + eth->h_source[i];
+  h = h * 31 + bpf_ntohs(eth->h_proto);
+  return h & 0xFFFFF;
+}
+
 static __always_inline struct tunnel_config *get_tunnel_config(void) {
   __u32 key = 0;
   return bpf_map_lookup_elem(&tunnel_config_map, &key);
 }
 
 static __always_inline int build_outer_headers(void *data, void *data_end,
-                                               struct tunnel_config *cfg) {
+                                               struct tunnel_config *cfg,
+                                               __u32 flow_hash) {
   struct ethhdr *eth = data;
   if ((void *)(eth + 1) > data_end) return -1;
   eth->h_proto = bpf_htons(ETH_P_IPV6);
@@ -122,7 +137,9 @@ static __always_inline int build_outer_headers(void *data, void *data_end,
   if ((void *)(ip6 + 1) > data_end) return -1;
   ip6->version = 6;
   ip6->priority = 0;
-  __builtin_memset(ip6->flow_lbl, 0, sizeof(ip6->flow_lbl));
+  ip6->flow_lbl[0] = (flow_hash >> 16) & 0x0F;
+  ip6->flow_lbl[1] = (flow_hash >> 8) & 0xFF;
+  ip6->flow_lbl[2] = flow_hash & 0xFF;
   ip6->nexthdr = ETHERIP_PROTO;
   ip6->hop_limit = HOP_LIMIT_DEFAULT;
   __builtin_memcpy(ip6->saddr.s6_addr, cfg->src_addr, sizeof(cfg->src_addr));
@@ -146,7 +163,10 @@ static __always_inline int clamp_inner_tcp_mss(void *data, void *data_end,
     struct iphdr *ip = (void *)(inner_eth + 1);
     if ((void *)(ip + 1) > data_end) return -1;
     if (ip->protocol == 6) {
-      return update_tcp_mss((void *)(ip + 1), data_end, cfg->mss_clamp_ipv4);
+      __u8 ihl = ip->ihl;
+      if (ihl < 5) return -1;
+      void *tcp = (void *)ip + (__u32)ihl * 4;
+      return update_tcp_mss(tcp, data_end, cfg->mss_clamp_ipv4);
     }
   }
 
@@ -230,6 +250,8 @@ static __always_inline int handle_encap(struct xdp_md *ctx,
   struct ethhdr *orig_eth = data;
   if ((void *)(orig_eth + 1) > data_end) return XDP_ABORTED;
 
+  __u32 flow_hash = inner_flow_hash(data, data_end);
+
   int outer_len = (int)(sizeof(struct ethhdr) + sizeof(struct ipv6hdr) +
                         sizeof(struct etherip_hdr));
   if (bpf_xdp_adjust_head(ctx, 0 - outer_len)) {
@@ -240,7 +262,7 @@ static __always_inline int handle_encap(struct xdp_md *ctx,
   data = (void *)(long)ctx->data;
   data_end = (void *)(long)ctx->data_end;
 
-  if (build_outer_headers(data, data_end, cfg)) {
+  if (build_outer_headers(data, data_end, cfg, flow_hash)) {
     dbg_inc(DBG_ENCAP_BUILD_FAIL);
     return XDP_ABORTED;
   }

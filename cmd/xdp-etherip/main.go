@@ -178,10 +178,6 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU in
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
-	xdpEndMAC, err := getInterfaceMAC(xdpEnd)
-	if err != nil {
-		return coreelf.TunnelConfig{}, err
-	}
 	externalMAC, err := getInterfaceMAC(externalDev)
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
@@ -197,7 +193,6 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU in
 		InternalIfindex: internalIdx,
 		ExternalIfindex: externalIdx,
 		TunnelMAC:       tunnelMAC,
-		InternalMAC:     xdpEndMAC,
 		ExternalMAC:     externalMAC,
 		DstMAC:          dstMAC,
 		MSSClampIPv4:    mssV4,
@@ -257,25 +252,29 @@ func cleanup(devices []string, tunnelName string) error {
 	return nil
 }
 
-func loadAndAttach(externalDev string, cfg *coreelf.TunnelConfig, xdpEnd string) ([]string, *ebpf.Map, error) {
+func loadAndAttach(externalDev string, cfg *coreelf.TunnelConfig, xdpEnd string) ([]string, *ebpf.Map, func(), error) {
 	obj, err := coreelf.ReadCollection()
 	if err != nil {
-		return nil, nil, fmt.Errorf("load ebpf: %w", err)
+		return nil, nil, nil, fmt.Errorf("load ebpf: %w", err)
 	}
 	if err := coreelf.PopulateTunnelConfig(obj.TunnelConfigMap, *cfg); err != nil {
-		return nil, nil, fmt.Errorf("populate tunnel config: %w", err)
+		return nil, nil, nil, fmt.Errorf("populate tunnel config: %w", err)
 	}
 	if err := coreelf.PopulateRedirectDevmap(obj.RedirectDevmap, cfg.ExternalIfindex, cfg.InternalIfindex); err != nil {
-		return nil, nil, fmt.Errorf("populate redirect devmap: %w", err)
+		return nil, nil, nil, fmt.Errorf("populate redirect devmap: %w", err)
 	}
 	if err := attachDevice(obj.XdpProg, xdpEnd); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if err := attachDevice(obj.XdpProg, externalDev); err != nil {
-		return nil, nil, err
+		if detachErr := xdptool.Detach(xdpEnd); detachErr != nil {
+			log.Printf("detach %s after partial attach: %v", xdpEnd, detachErr)
+		}
+		return nil, nil, nil, err
 	}
 	devices := []string{externalDev, xdpEnd}
-	return devices, obj.DebugCounters, nil
+	closeFn := func() { obj.Close() }
+	return devices, obj.DebugCounters, closeFn, nil
 }
 
 func setupTunnel(cmd *cli.Command) (string, string, int, error) {
@@ -316,13 +315,14 @@ func run(ctx context.Context, cmd *cli.Command) (retErr error) {
 	if err := attachDevice(passProg, tunnelName); err != nil {
 		return err
 	}
-	devices, debugMap, err := loadAndAttach(cmd.String("external"), &cfg, xdpEnd)
+	devices, debugMap, closeBPF, err := loadAndAttach(cmd.String("external"), &cfg, xdpEnd)
 	if err != nil {
 		return err
 	}
+	defer closeBPF()
 	devices = append(devices, tunnelName)
-	log.Printf("tunnel config: tunnel_mac=%x internal_mac=%x external_mac=%x dst_mac=%x",
-		cfg.TunnelMAC, cfg.InternalMAC, cfg.ExternalMAC, cfg.DstMAC)
+	log.Printf("tunnel config: tunnel_mac=%x external_mac=%x dst_mac=%x",
+		cfg.TunnelMAC, cfg.ExternalMAC, cfg.DstMAC)
 	log.Printf("tunnel interface %s is ready", tunnelName)
 	return waitForSignal(devices, tunnelName, debugMap)
 }
