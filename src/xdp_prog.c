@@ -118,6 +118,25 @@ static __always_inline __u32 inner_flow_hash(void *data, void *data_end) {
   for (int i = 0; i < 6; i++)
     h = h * 31 + eth->h_source[i];
   h = h * 31 + bpf_ntohs(eth->h_proto);
+
+  if (eth->h_proto == bpf_htons(ETH_P_IP)) {
+    struct iphdr *ip = (void *)(eth + 1);
+    if ((void *)(ip + 1) <= data_end) {
+      h = h * 31 + ip->saddr;
+      h = h * 31 + ip->daddr;
+    }
+  } else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
+    struct ipv6hdr *ip6 = (void *)(eth + 1);
+    if ((void *)(ip6 + 1) <= data_end) {
+#pragma unroll
+      for (int i = 0; i < 16; i++)
+        h = h * 31 + ip6->saddr.s6_addr[i];
+#pragma unroll
+      for (int i = 0; i < 16; i++)
+        h = h * 31 + ip6->daddr.s6_addr[i];
+    }
+  }
+
   return h & 0xFFFFF;
 }
 

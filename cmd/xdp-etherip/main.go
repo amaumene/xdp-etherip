@@ -70,6 +70,9 @@ func parseIPv6ToBytes(addr string) ([16]byte, error) {
 	if ip == nil {
 		return [16]byte{}, fmt.Errorf("invalid IPv6 address: %s", addr)
 	}
+	if ip.To4() != nil {
+		return [16]byte{}, fmt.Errorf("not an IPv6 address: %s", addr)
+	}
 	ip = ip.To16()
 	if ip == nil {
 		return [16]byte{}, fmt.Errorf("not an IPv6 address: %s", addr)
@@ -228,12 +231,15 @@ func dumpDebugCounters(debugMap *ebpf.Map) {
 	log.Println("--- end counters ---")
 }
 
-func waitForSignal(devices []string, tunnelName string, debugMap *ebpf.Map) error {
+func waitForSignal(ctx context.Context, devices []string, tunnelName string, debugMap *ebpf.Map) error {
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
 	log.Println("XDP program successfully loaded and attached.")
 	log.Println("Press CTRL+C to stop.")
-	<-signalChan
+	select {
+	case <-signalChan:
+	case <-ctx.Done():
+	}
 	dumpDebugCounters(debugMap)
 	return cleanup(devices, tunnelName)
 }
@@ -296,8 +302,9 @@ func run(ctx context.Context, cmd *cli.Command) (retErr error) {
 	if err != nil {
 		return err
 	}
+	cleanedUp := false
 	defer func() {
-		if retErr != nil {
+		if retErr != nil && !cleanedUp {
 			if delErr := xdptool.DeleteVethPair(tunnelName); delErr != nil {
 				log.Printf("cleanup veth %s: %v", tunnelName, delErr)
 			}
@@ -324,5 +331,6 @@ func run(ctx context.Context, cmd *cli.Command) (retErr error) {
 	log.Printf("tunnel config: tunnel_mac=%x external_mac=%x dst_mac=%x",
 		cfg.TunnelMAC, cfg.ExternalMAC, cfg.DstMAC)
 	log.Printf("tunnel interface %s is ready", tunnelName)
-	return waitForSignal(devices, tunnelName, debugMap)
+	cleanedUp = true
+	return waitForSignal(ctx, devices, tunnelName, debugMap)
 }

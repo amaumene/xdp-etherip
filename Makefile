@@ -39,4 +39,4 @@ test:
 .PHONY: fmt
 fmt:
 	go fmt ./...
-	find . -iname *.h -o -iname *.c | xargs clang-format -i -style=Google 
+	find . -iname '*.h' -o -iname '*.c' | xargs clang-format -i -style=Google 

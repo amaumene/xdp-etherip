@@ -45,15 +45,7 @@ func generateIPv4TCPInput(t *testing.T) []byte {
 			{
 				OptionType:   0x08,
 				OptionLength: 10,
-				OptionData:   []byte{0x00, 0x00, 0x00, 0x00, 0x00},
-			},
-			{
-				OptionType:   0x01,
-				OptionLength: 1,
-			},
-			{
-				OptionType:   0x01,
-				OptionLength: 1,
+				OptionData:   []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 			},
 		},
 	}
@@ -72,7 +64,8 @@ func generateIPv4TCPInput(t *testing.T) []byte {
 }
 
 // innerFlowHash mirrors the BPF inner_flow_hash function: polynomial hash
-// of the inner Ethernet header (dst MAC, src MAC, EtherType) masked to 20 bits.
+// of the inner Ethernet header (dst MAC, src MAC, EtherType) plus L3
+// addresses (IPv4 src/dst or IPv6 src/dst) masked to 20 bits.
 func innerFlowHash(pkt []byte) uint32 {
 	if len(pkt) < 14 {
 		return 0
@@ -87,6 +80,27 @@ func innerFlowHash(pkt []byte) uint32 {
 	// h_proto in host byte order (bpf_ntohs of the network-order value)
 	proto := uint32(pkt[12])<<8 | uint32(pkt[13])
 	h = h*31 + proto
+
+	switch proto {
+	case 0x0800: // IPv4
+		if len(pkt) >= 14+20 {
+			// saddr as little-endian u32 (matches BPF iphdr->saddr on LE)
+			saddr := uint32(pkt[26]) | uint32(pkt[27])<<8 | uint32(pkt[28])<<16 | uint32(pkt[29])<<24
+			daddr := uint32(pkt[30]) | uint32(pkt[31])<<8 | uint32(pkt[32])<<16 | uint32(pkt[33])<<24
+			h = h*31 + saddr
+			h = h*31 + daddr
+		}
+	case 0x86DD: // IPv6
+		if len(pkt) >= 14+40 {
+			for i := 22; i < 22+16; i++ {
+				h = h*31 + uint32(pkt[i]) // saddr
+			}
+			for i := 38; i < 38+16; i++ {
+				h = h*31 + uint32(pkt[i]) // daddr
+			}
+		}
+	}
+
 	return h & 0xFFFFF
 }
 
@@ -132,15 +146,7 @@ func generateIPv4TCPOutput(t *testing.T, input []byte) []byte {
 			{
 				OptionType:   0x08,
 				OptionLength: 10,
-				OptionData:   []byte{0x00, 0x00, 0x00, 0x00, 0x00},
-			},
-			{
-				OptionType:   0x01,
-				OptionLength: 1,
-			},
-			{
-				OptionType:   0x01,
-				OptionLength: 1,
+				OptionData:   []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
 			},
 		},
 	}

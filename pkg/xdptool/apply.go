@@ -213,8 +213,7 @@ func Detach(device string) error {
 	if err != nil {
 		return fmt.Errorf("find link %s: %w", device, err)
 	}
-	if err := netlink.LinkSetXdpFd(link, -1); err != nil {
-		return fmt.Errorf("detach xdp on %s: %w", device, err)
-	}
+	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsSKBMode)
+	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsDRVMode)
 	return nil
 }
