@@ -1,9 +1,22 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:base"
+    "config:recommended"
   ],
   "timezone": "Asia/Tokyo",
-  "automerge": true,
-  "branchConcurrentLimit": 0
+  "automerge": false,
+  "branchConcurrentLimit": 2,
+  "packageRules": [
+    {
+      "matchPackageNames": [
+        "github.com/cilium/ebpf",
+        "github.com/vishvananda/netlink"
+      ],
+      "automerge": false
+    },
+    {
+      "matchUpdateTypes": ["patch"],
+      "automerge": true
+    }
+  ]
 }

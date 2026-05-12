@@ -1,0 +1,16 @@
+name: test
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24", "1.26", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "${{ matrix.go }}"
+      - run: go test -v -race -shuffle=on ./...
+      - run: go vet ./...
