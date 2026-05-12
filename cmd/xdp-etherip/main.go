@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -19,9 +19,14 @@ import (
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(),
+		syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
+	defer stop()
+
 	cmd := newApp(version.Version)
-	if err := cmd.Run(context.Background(), os.Args); err != nil {
-		log.Fatalf("%+v", err)
+	if err := cmd.Run(ctx, os.Args); err != nil {
+		slog.Error("fatal", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -126,39 +131,48 @@ func resolveNeighborMAC(ifindex int, ip net.IP) ([6]byte, error) {
 }
 
 const (
-	maxRetries = 10
-	retryDelay = 500 * time.Millisecond
+	resolutionRetries = 10
+	resolutionDelay   = 500 * time.Millisecond
 )
 
-func resolveDstMAC(externalIdx uint32, dstIP net.IP) ([6]byte, error) {
+func resolveDstMAC(ctx context.Context, externalIdx uint32, dstIP net.IP) ([6]byte, error) {
+	var zero [6]byte
 	var nextHop net.IP
 	var err error
-	for i := range maxRetries {
+	for i := range resolutionRetries {
 		if nextHop, err = resolveNextHop(dstIP); err == nil {
 			break
 		}
-		if i < maxRetries-1 {
-			log.Printf("retry route %d/%d: %v", i+1, maxRetries, err)
-			time.Sleep(retryDelay * time.Duration(i+1))
+		if i < resolutionRetries-1 {
+			slog.WarnContext(ctx, "route retry", "attempt", i+1, "max", resolutionRetries, "error", err)
+			select {
+			case <-time.After(resolutionDelay * time.Duration(i+1)):
+			case <-ctx.Done():
+				return zero, ctx.Err()
+			}
 		}
 	}
 	if err != nil {
-		return [6]byte{}, err
+		return zero, err
 	}
 	var mac [6]byte
-	for i := range maxRetries {
+	for i := range resolutionRetries {
 		if mac, err = resolveNeighborMAC(int(externalIdx), nextHop); err == nil {
 			return mac, nil
 		}
-		if i < maxRetries-1 {
-			log.Printf("retry neighbor %d/%d: %v", i+1, maxRetries, err)
-			time.Sleep(retryDelay * time.Duration(i+1))
+		if i < resolutionRetries-1 {
+			slog.WarnContext(ctx, "neighbor retry", "attempt", i+1, "max", resolutionRetries, "error", err)
+			select {
+			case <-time.After(resolutionDelay * time.Duration(i+1)):
+			case <-ctx.Done():
+				return zero, ctx.Err()
+			}
 		}
 	}
 	return mac, err
 }
 
-func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU int) (coreelf.TunnelConfig, error) {
+func buildTunnelConfig(ctx context.Context, cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU int) (coreelf.TunnelConfig, error) {
 	externalDev := cmd.String("external")
 	externalIdx, err := resolveIfindex(externalDev)
 	if err != nil {
@@ -185,7 +199,7 @@ func buildTunnelConfig(cmd *cli.Command, tunnelName, xdpEnd string, tunnelMTU in
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
-	dstMAC, err := resolveDstMAC(externalIdx, dstIP)
+	dstMAC, err := resolveDstMAC(ctx, externalIdx, dstIP)
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
@@ -209,9 +223,9 @@ func attachDevice(prog *ebpf.Program, dev string) error {
 		return fmt.Errorf("attach %s: %w", dev, err)
 	}
 	if isNative {
-		log.Printf("attached device: %s (native/driver)", dev)
+		slog.Info("attached device", "device", dev, "mode", "native")
 	} else {
-		log.Printf("attached device: %s (generic/SKB)", dev)
+		slog.Info("attached device", "device", dev, "mode", "generic")
 	}
 	return nil
 }
@@ -219,27 +233,22 @@ func attachDevice(prog *ebpf.Program, dev string) error {
 func dumpDebugCounters(debugMap *ebpf.Map) {
 	counters, err := coreelf.ReadDebugCounters(debugMap)
 	if err != nil {
-		log.Printf("read debug counters: %v", err)
+		slog.Error("read debug counters", "error", err)
 		return
 	}
-	log.Println("--- debug counters ---")
+	slog.Info("--- debug counters ---")
 	for i, name := range coreelf.DebugCounterNames {
 		if counters[i] > 0 {
-			log.Printf("  %s: %d", name, counters[i])
+			slog.Info("", name, counters[i])
 		}
 	}
-	log.Println("--- end counters ---")
+	slog.Info("--- end counters ---")
 }
 
 func waitForSignal(ctx context.Context, devices []string, tunnelName string, debugMap *ebpf.Map) error {
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
-	log.Println("XDP program successfully loaded and attached.")
-	log.Println("Press CTRL+C to stop.")
-	select {
-	case <-signalChan:
-	case <-ctx.Done():
-	}
+	slog.Info("XDP program successfully loaded and attached")
+	slog.Info("Press CTRL+C to stop")
+	<-ctx.Done()
 	dumpDebugCounters(debugMap)
 	return cleanup(devices, tunnelName)
 }
@@ -247,14 +256,14 @@ func waitForSignal(ctx context.Context, devices []string, tunnelName string, deb
 func cleanup(devices []string, tunnelName string) error {
 	for _, dev := range devices {
 		if err := xdptool.Detach(dev); err != nil {
-			log.Printf("detach %s: %v", dev, err)
+			slog.Error("detach device", "device", dev, "error", err)
 		}
-		log.Println("detach device:", dev)
+		slog.Info("detach device", "device", dev)
 	}
 	if err := xdptool.DeleteVethPair(tunnelName); err != nil {
 		return fmt.Errorf("delete veth pair: %w", err)
 	}
-	log.Println("deleted veth pair:", tunnelName)
+	slog.Info("deleted veth pair", "name", tunnelName)
 	return nil
 }
 
@@ -263,6 +272,12 @@ func loadAndAttach(externalDev string, cfg *coreelf.TunnelConfig, xdpEnd string)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("load ebpf: %w", err)
 	}
+	success := false
+	defer func() {
+		if !success {
+			obj.Close()
+		}
+	}()
 	if err := coreelf.PopulateTunnelConfig(obj.TunnelConfigMap, *cfg); err != nil {
 		return nil, nil, nil, fmt.Errorf("populate tunnel config: %w", err)
 	}
@@ -274,13 +289,13 @@ func loadAndAttach(externalDev string, cfg *coreelf.TunnelConfig, xdpEnd string)
 	}
 	if err := attachDevice(obj.XdpProg, externalDev); err != nil {
 		if detachErr := xdptool.Detach(xdpEnd); detachErr != nil {
-			log.Printf("detach %s after partial attach: %v", xdpEnd, detachErr)
+			slog.Error("detach after partial attach", "device", xdpEnd, "error", detachErr)
 		}
 		return nil, nil, nil, err
 	}
+	success = true
 	devices := []string{externalDev, xdpEnd}
-	closeFn := func() { obj.Close() }
-	return devices, obj.DebugCounters, closeFn, nil
+	return devices, obj.DebugCounters, obj.Close, nil
 }
 
 func setupTunnel(cmd *cli.Command) (string, string, int, error) {
@@ -293,7 +308,7 @@ func setupTunnel(cmd *cli.Command) (string, string, int, error) {
 	if err != nil {
 		return "", "", 0, fmt.Errorf("create veth pair: %w", err)
 	}
-	log.Printf("created veth pair: %s <-> %s (mtu %d)", tunnelName, xdpEnd, tunnelMTU)
+	slog.Info("created veth pair", "tunnel", tunnelName, "peer", xdpEnd, "mtu", tunnelMTU)
 	return tunnelName, xdpEnd, tunnelMTU, nil
 }
 
@@ -303,14 +318,14 @@ func run(ctx context.Context, cmd *cli.Command) (retErr error) {
 		return err
 	}
 	cleanedUp := false
-	defer func() {
-		if retErr != nil && !cleanedUp {
-			if delErr := xdptool.DeleteVethPair(tunnelName); delErr != nil {
-				log.Printf("cleanup veth %s: %v", tunnelName, delErr)
+		defer func() {
+			if retErr != nil && !cleanedUp {
+				if delErr := xdptool.DeleteVethPair(tunnelName); delErr != nil {
+					slog.Error("cleanup veth", "name", tunnelName, "error", delErr)
+				}
 			}
-		}
-	}()
-	cfg, err := buildTunnelConfig(cmd, tunnelName, xdpEnd, tunnelMTU)
+		}()
+		cfg, err := buildTunnelConfig(ctx, cmd, tunnelName, xdpEnd, tunnelMTU)
 	if err != nil {
 		return err
 	}
@@ -328,9 +343,11 @@ func run(ctx context.Context, cmd *cli.Command) (retErr error) {
 	}
 	defer closeBPF()
 	devices = append(devices, tunnelName)
-	log.Printf("tunnel config: tunnel_mac=%x external_mac=%x dst_mac=%x",
-		cfg.TunnelMAC, cfg.ExternalMAC, cfg.DstMAC)
-	log.Printf("tunnel interface %s is ready", tunnelName)
+	slog.Info("tunnel config",
+		"tunnel_mac", fmt.Sprintf("%x", cfg.TunnelMAC),
+		"external_mac", fmt.Sprintf("%x", cfg.ExternalMAC),
+		"dst_mac", fmt.Sprintf("%x", cfg.DstMAC))
+	slog.Info("tunnel interface ready", "name", tunnelName)
 	cleanedUp = true
 	return waitForSignal(ctx, devices, tunnelName, debugMap)
 }
