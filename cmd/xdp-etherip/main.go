@@ -13,6 +13,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/urfave/cli/v3"
 	"github.com/vishvananda/netlink"
+	"github.com/x86taka/xdp-etherip/internal/tunnel"
 	"github.com/x86taka/xdp-etherip/pkg/coreelf"
 	"github.com/x86taka/xdp-etherip/pkg/version"
 	"github.com/x86taka/xdp-etherip/pkg/xdptool"
@@ -69,24 +70,6 @@ func resolveIfindex(device string) (uint32, error) {
 	}
 	return uint32(link.Attrs().Index), nil
 }
-
-func parseIPv6ToBytes(addr string) ([16]byte, error) {
-	ip := net.ParseIP(addr)
-	if ip == nil {
-		return [16]byte{}, fmt.Errorf("invalid IPv6 address: %s", addr)
-	}
-	if ip.To4() != nil {
-		return [16]byte{}, fmt.Errorf("not an IPv6 address: %s", addr)
-	}
-	ip = ip.To16()
-	if ip == nil {
-		return [16]byte{}, fmt.Errorf("not an IPv6 address: %s", addr)
-	}
-	var result [16]byte
-	copy(result[:], ip)
-	return result, nil
-}
-
 func getInterfaceMAC(name string) ([6]byte, error) {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
@@ -182,11 +165,11 @@ func buildTunnelConfig(ctx context.Context, cmd *cli.Command, tunnelName, xdpEnd
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
-	srcAddr, err := parseIPv6ToBytes(cmd.String("src-ip6"))
+	srcAddr, err := tunnel.ParseIPv6ToBytes(cmd.String("src-ip6"))
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
-	dstAddr, err := parseIPv6ToBytes(cmd.String("dst-ip6"))
+	dstAddr, err := tunnel.ParseIPv6ToBytes(cmd.String("dst-ip6"))
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
@@ -203,7 +186,7 @@ func buildTunnelConfig(ctx context.Context, cmd *cli.Command, tunnelName, xdpEnd
 	if err != nil {
 		return coreelf.TunnelConfig{}, err
 	}
-	mssV4, mssV6 := coreelf.ComputeMSSClamp(tunnelMTU)
+	mssV4, mssV6 := tunnel.ComputeMSSClamp(tunnelMTU)
 	return coreelf.TunnelConfig{
 		SrcAddr:         srcAddr,
 		DstAddr:         dstAddr,
