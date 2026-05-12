@@ -3,6 +3,7 @@ package xdptool
 import (
 	"encoding/binary"
 	"fmt"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -11,6 +12,7 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// XDP_PASS action value from linux/bpf.h — accept packet and let stack handle it.
 const xdpPass = 2
 
 const (
@@ -97,6 +99,7 @@ func ethtoolIoctl(fd int, name string, data []byte) error {
 	copy(req.name[:], name)
 	req.data = unsafe.Pointer(&data[0])
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), siocETHTOOL, uintptr(unsafe.Pointer(&req)))
+	runtime.KeepAlive(&data[0])
 	if errno != 0 {
 		return errno
 	}
@@ -104,15 +107,19 @@ func ethtoolIoctl(fd int, name string, data []byte) error {
 }
 
 func configureVethPair(name, peerName string, mtu int) error {
+	// Set MTU on both ends of the veth pair.
 	if err := setMTU(name, mtu); err != nil {
 		return err
 	}
 	if err := setMTU(peerName, mtu); err != nil {
 		return err
 	}
+	// Disable TX checksum offload — the virtual tunnel peers don't benefit
+	// from offload features and they can confuse the stack.
 	if err := disableTxOffload(name); err != nil {
 		return err
 	}
+	// Bring both ends up.
 	if err := bringUpLink(name); err != nil {
 		return err
 	}
@@ -122,9 +129,11 @@ func configureVethPair(name, peerName string, mtu int) error {
 func deleteIfExists(name string) {
 	link, err := netlink.LinkByName(name)
 	if err != nil {
-		return
+		return // link doesn't exist, expected
 	}
-	netlink.LinkDel(link)
+	if err := netlink.LinkDel(link); err != nil {
+		// Pre-cleanup failure is non-fatal; LinkAdd will fail if it matters.
+	}
 }
 
 func CreateVethPair(name string, mtu int) (string, error) {
@@ -196,8 +205,8 @@ func Attach(prog *ebpf.Program, device string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("%s not found: %w", device, err)
 	}
-	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsSKBMode)
-	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsDRVMode)
+	_ = netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsSKBMode)
+	_ = netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsDRVMode)
 	nativeErr := netlink.LinkSetXdpFdWithFlags(link, prog.FD(), xdpFlagsDRVMode)
 	if nativeErr == nil {
 		return true, nil
@@ -213,7 +222,10 @@ func Detach(device string) error {
 	if err != nil {
 		return fmt.Errorf("find link %s: %w", device, err)
 	}
-	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsSKBMode)
-	netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsDRVMode)
+	err1 := netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsSKBMode)
+	err2 := netlink.LinkSetXdpFdWithFlags(link, -1, xdpFlagsDRVMode)
+	if err1 != nil && err2 != nil {
+		return fmt.Errorf("detach %s: skb(%v) drv(%v)", device, err1, err2)
+	}
 	return nil
 }
