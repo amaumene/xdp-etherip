@@ -20,4 +20,6 @@ require (
 	golang.org/x/sys v0.37.0 // indirect
 )
 
+// gopacket fork adds layers.EtherIP (RFC 3378) type used in BPF tests.
+// Upstream: https://github.com/google/gopacket.
 replace github.com/google/gopacket v1.1.19 => github.com/x86taka/gopacket v0.0.0-20231210055638-74b4deb65353
