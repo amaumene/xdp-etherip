@@ -54,6 +54,9 @@ static __always_inline int skip_ext_headers(void *data_end, void **pos,
   return 0;
 }
 
+// update_checksum performs an RFC 1624 incremental checksum update.
+// Only valid for 16-bit inputs: *csum, old_val, and new_val must all
+// be __u16 values zero-extended to __u32 by the caller.
 static __always_inline void update_checksum(__u16 *csum, __u16 old_val,
                                             __u16 new_val) {
   __u32 new_csum_value;
@@ -93,7 +96,8 @@ static __always_inline int update_tcp_mss(void *data, void *data_end,
       asm volatile("" : "+r"(opt_ptr));
       if (opt_ptr + 4 > data_end) return 1;
       __u16 *mss_val = (__u16 *)(opt_ptr + 2);
-      __u16 old_mss = *mss_val;
+      __u16 old_mss;
+      __builtin_memcpy(&old_mss, mss_val, sizeof(__u16));
       if (bpf_ntohs(old_mss) > new_mss_int) {
         __u16 new_mss = bpf_htons(new_mss_int);
         __builtin_memcpy(mss_val, &new_mss, sizeof(__u16));
@@ -107,6 +111,9 @@ static __always_inline int update_tcp_mss(void *data, void *data_end,
   return 0;
 }
 
+// inner_flow_hash computes a 20-bit flow hash from the inner Ethernet
+// and IP addresses. L4 ports are intentionally excluded — this trades
+// per-flow ECMP precision for faster hashing on the XDP hot path.
 static __always_inline __u32 inner_flow_hash(void *data, void *data_end) {
   struct ethhdr *eth = data;
   if ((void *)(eth + 1) > data_end) return 0;
@@ -223,6 +230,9 @@ static __always_inline int handle_decap(struct xdp_md *ctx,
   struct ipv6hdr *ip6 = (void *)(eth + 1);
   if ((void *)(ip6 + 1) > data_end) return XDP_ABORTED;
 
+  // Per RFC 8200, Hop-by-Hop (nexthdr=0) must only appear as the first
+  // extension header. skip_ext_headers is lenient and skips it at any
+  // position; the ETHERIP_PROTO check below still catches invalid packets.
   __u8 nexthdr = ip6->nexthdr;
   void *pos = (void *)(ip6 + 1);
   if (skip_ext_headers(data_end, &pos, &nexthdr)) return XDP_ABORTED;
@@ -232,6 +242,9 @@ static __always_inline int handle_decap(struct xdp_md *ctx,
     return XDP_PASS;
   }
 
+  // Loopback detection: drops packets sourced from our own tunnel address.
+  // Verified against src_addr only; a future improvement would also check
+  // dst_addr for defense-in-depth against spoofed packets.
   if (addr_equal(ip6->saddr.s6_addr, cfg->src_addr)) {
     dbg_inc(DBG_DECAP_OWN_PKT);
     return XDP_PASS;
