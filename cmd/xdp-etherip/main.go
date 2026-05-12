@@ -278,7 +278,7 @@ func loadAndAttach(externalDev string, cfg *coreelf.TunnelConfig, xdpEnd string)
 	}
 	success = true
 	devices := []string{externalDev, xdpEnd}
-	return devices, obj.DebugCounters, obj.Close, nil
+	return devices, obj.DebugCounters, func() { _ = obj.Close() }, nil
 }
 
 func setupTunnel(cmd *cli.Command) (string, string, int, error) {

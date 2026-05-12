@@ -7,6 +7,7 @@ import (
 func TestValidateVethNames(t *testing.T) {
 	tests := []struct {
 		name    string
+		base    string
 		peer    string
 		wantErr bool
 	}{
@@ -18,10 +19,10 @@ func TestValidateVethNames(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateVethNames(tt.name, tt.peer)
+			err := validateVethNames(tt.base, tt.peer)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("validateVethNames(%q, %q) error = %v, wantErr = %v",
-					tt.name, tt.peer, err, tt.wantErr)
+					tt.base, tt.peer, err, tt.wantErr)
 			}
 		})
 	}

@@ -18,7 +18,7 @@ func TestParseIPv6ToBytes(t *testing.T) {
 		{"empty", "", true},
 		{"invalid char", "not-an-ip", true},
 		{"ipv4", "192.168.1.1", true},
-		{"ipv4 mapped", "::ffff:192.0.2.1", false}, // valid IPv6
+		{"ipv4 mapped", "::ffff:192.0.2.1", true}, // IPv4-mapped, not a real IPv6
 	}
 
 	for _, tt := range tests {
@@ -39,11 +39,6 @@ func TestComputeMSSClamp(t *testing.T) {
 		wantMSSv4 uint16
 		wantMSSv6 uint16
 	}{
-		{"1500 mtu", 1500 - 56, 1424, 1404}, // 1444 - 20 - 20 = 1404 v4? wait...
-		// tunnel_mtu = external_mtu - 56
-		// So with external mtu 1500, tunnel_mtu = 1444
-		// IPv4: 1444 - 20 - 20 = 1404
-		// IPv6: 1444 - 40 - 20 = 1384
 		{"1444 tunnel mtu", 1444, 1404, 1384},
 		{"1280 tunnel mtu", 1280, 1240, 1220},
 		{"too small", 70, 0, 0},
