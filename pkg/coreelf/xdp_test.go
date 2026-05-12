@@ -266,3 +266,139 @@ func TestXDPProg(t *testing.T) {
 		t.Errorf("output mismatch (-want +got):\n%s", diff)
 	}
 }
+
+// generateEtherIPInput builds an outer-Ethernet + IPv6 + EtherIP + inner-Ethernet
+// frame for decap path testing. The remote (fe80::2) sends to us (fe80::1).
+func generateEtherIPInput(t *testing.T, inner []byte) []byte {
+	t.Helper()
+
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	buf := gopacket.NewSerializeBuffer()
+
+	ip6h := &layers.IPv6{
+		Version:    6,
+		NextHeader: layers.IPProtocolEtherIP,
+		HopLimit:   64,
+		SrcIP:      net.ParseIP("fe80::2"), // remote
+		DstIP:      net.ParseIP("fe80::1"), // us
+	}
+	eiph := &layers.EtherIP{
+		Version:  3,
+		Reserved: 0,
+	}
+
+	err := gopacket.SerializeLayers(buf, opts,
+		&layers.Ethernet{
+			DstMAC:       testExternalMAC[:],
+			SrcMAC:       testDstMAC[:], // remote MAC
+			EthernetType: layers.EthernetTypeIPv6,
+		},
+		ip6h, eiph,
+		gopacket.Payload(inner),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestXDPProgDecap(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatal(err)
+	}
+	objs, err := coreelf.ReadCollection()
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			t.Fatalf("%+v\n", verr)
+		} else {
+			t.Fatal(err)
+		}
+	}
+	defer objs.Close()
+
+	setupTestTunnelConfig(t, objs.TunnelConfigMap)
+	setupTestDevmap(t, objs.RedirectDevmap)
+
+	// Build a simple inner frame: broadcast Ethernet + IPv4/ICMP
+	innerEth := &layers.Ethernet{
+		DstMAC:       []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+		SrcMAC:       []byte{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
+		EthernetType: layers.EthernetTypeIPv4,
+	}
+	innerIPv4 := &layers.IPv4{
+		Version: 4, TTL: 64, Protocol: layers.IPProtocolICMPv4,
+		SrcIP: net.IP{10, 0, 0, 1}, DstIP: net.IP{10, 0, 0, 2},
+	}
+	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
+	innerBuf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(innerBuf, opts,
+		innerEth, innerIPv4, gopacket.Payload([]byte{0x08, 0x00, 0x00, 0x00}),
+	); err != nil {
+		t.Fatal(err)
+	}
+	innerFrame := innerBuf.Bytes()
+
+	input := generateEtherIPInput(t, innerFrame)
+
+	xdpmd := XdpMd{
+		Data:           0,
+		DataEnd:        uint32(len(input)),
+		IngressIfindex: 2, // external interface
+	}
+
+	ret, got, err := ebpfTestRun(input, objs.XdpProg, xdpmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if ret != 4 {
+		t.Errorf("decap: got ret=%d, want XDP_REDIRECT(4)", ret)
+	}
+
+	// Expected output: inner frame with DstMAC rewritten to tunnel_mac
+	wantFrame := make([]byte, len(innerFrame))
+	copy(wantFrame, innerFrame)
+	copy(wantFrame[0:6], testExternalMAC[:]) // DstMAC → tunnel_mac
+
+	if diff := cmp.Diff(wantFrame, got); diff != "" {
+		t.Errorf("decap output mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestXDPProgDecapPassThru(t *testing.T) {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatal(err)
+	}
+	objs, err := coreelf.ReadCollection()
+	if err != nil {
+		var verr *ebpf.VerifierError
+		if errors.As(err, &verr) {
+			t.Fatalf("%+v\n", verr)
+		} else {
+			t.Fatal(err)
+		}
+	}
+	defer objs.Close()
+
+	setupTestTunnelConfig(t, objs.TunnelConfigMap)
+	setupTestDevmap(t, objs.RedirectDevmap)
+
+	// Send a plain IPv4 packet (not EtherIP) on the external interface.
+	pkt := generateIPv4TCPInput(t)
+	xdpmd := XdpMd{
+		Data:           0,
+		DataEnd:        uint32(len(pkt)),
+		IngressIfindex: 2,
+	}
+
+	ret, _, err := ebpfTestRun(pkt, objs.XdpProg, xdpmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Should be XDP_PASS (2) — non-IPv6 or non-EtherIP traffic passed through.
+	if ret != 2 {
+		t.Errorf("pass-thru: got ret=%d, want XDP_PASS(2)", ret)
+	}
+}
