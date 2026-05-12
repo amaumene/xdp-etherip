@@ -13,7 +13,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/urfave/cli/v3"
 	"github.com/vishvananda/netlink"
-	"github.com/x86taka/xdp-etherip/internal/tunnel"
+	"github.com/x86taka/xdp-etherip/pkg/tunnel"
 	"github.com/x86taka/xdp-etherip/pkg/coreelf"
 	"github.com/x86taka/xdp-etherip/pkg/version"
 	"github.com/x86taka/xdp-etherip/pkg/xdptool"

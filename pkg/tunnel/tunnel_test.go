@@ -3,7 +3,7 @@ package tunnel_test
 import (
 	"testing"
 
-	"github.com/x86taka/xdp-etherip/internal/tunnel"
+	"github.com/x86taka/xdp-etherip/pkg/tunnel"
 )
 
 func TestParseIPv6ToBytes(t *testing.T) {

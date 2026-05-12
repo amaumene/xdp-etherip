@@ -11,7 +11,13 @@ RUN apk add --no-cache \
     musl-dev
 
 WORKDIR /build
+
 COPY . .
+
+RUN rm go.mod && rm go.sum
+RUN go mod init github.com/amaumene/xdp-etherip && \
+    go mod edit -replace github.com/x86taka/xdp-etherip=./ && \
+    go mod tidy
 
 RUN mkdir -p include && \
     ln -s /usr/include/bpf/bpf_helper_defs.h include/ && \
